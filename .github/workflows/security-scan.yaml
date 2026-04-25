@@ -1,0 +1,163 @@
+name: LLM Security Review
+
+on:
+  pull_request_target:
+    branches: [security-review]
+
+jobs:
+  llm-security-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch PR head
+        run: git fetch origin pull/${{ github.event.pull_request.number }}/head:pr-head
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          git diff HEAD...pr-head \
+            -- '*.go' '*.yaml' '*.yml' '*.json' '*.toml' \
+            ':!vendor' ':!go.sum' \
+            > pr_diff.txt
+          echo "diff_size=$(wc -c < pr_diff.txt)" >> $GITHUB_OUTPUT
+
+      - name: Skip if diff is empty
+        if: steps.diff.outputs.diff_size == '0'
+        run: echo "No relevant code changes found. Skipping security scan."
+
+      - name: Run LLM Security Analysis
+        if: steps.diff.outputs.diff_size != '0'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, sys, urllib.request
+
+          diff_path = "pr_diff.txt"
+          with open(diff_path) as f:
+              diff = f.read()
+
+          if not diff.strip():
+              print("Empty diff, nothing to analyze.")
+              sys.exit(0)
+
+          # Truncate if too large (keep within token limits)
+          max_chars = 30000
+          truncated = False
+          if len(diff) > max_chars:
+              diff = diff[:max_chars]
+              truncated = True
+
+          prompt = f"""You are a security code reviewer for a Kubernetes network policy agent written in Go.
+          This project enforces eBPF-based network policies on EKS clusters.
+
+          Analyze this PR diff for security vulnerabilities.
+
+          Focus on:
+          - Command injection or unsafe exec calls
+          - Unsafe handling of user-supplied Kubernetes resource fields
+          - Privilege escalation in RBAC or container security contexts
+          - Sensitive data exposure (secrets, tokens, credentials in logs or env)
+          - Insecure file permissions or path traversal
+          - Race conditions in concurrent reconciliation or eBPF map access
+          - Unsafe deserialization or input parsing
+          - Missing error handling that could leak state
+          - Insecure network configurations or policy bypass vectors
+
+          For each issue found, provide:
+          1. Severity: CRITICAL / HIGH / MEDIUM / LOW
+          2. File and line reference from the diff
+          3. Description of the vulnerability
+          4. Recommended fix with a code snippet if applicable
+
+          If no issues found, respond with exactly: "No security issues detected."
+
+          {"Note: diff was truncated to fit token limits." if truncated else ""}
+
+          PR Diff:
+          ```
+          {diff}
+          ```"""
+
+          payload = json.dumps({
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 4096,
+              "messages": [{"role": "user", "content": prompt}]
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=payload,
+              headers={
+                  "Content-Type": "application/json",
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  body = json.loads(resp.read())
+          except urllib.error.HTTPError as e:
+              print(f"API error {e.code}: {e.read().decode()}", file=sys.stderr)
+              sys.exit(1)
+
+          analysis = body["content"][0]["text"]
+
+          # Write analysis to file for the comment step
+          with open("security_analysis.md", "w") as f:
+              f.write("## 🔒 LLM Security Review\n\n")
+              f.write(analysis)
+              if truncated:
+                  f.write("\n\n---\n⚠️ *Diff was truncated. Large PRs may have unreviewed sections.*\n")
+
+          # Determine if issues were found (for status check)
+          has_issues = "no security issues detected" not in analysis.lower()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+              gh.write(f"has_issues={'true' if has_issues else 'false'}\n")
+
+          print(analysis)
+          PYEOF
+
+      - name: Comment PR with results
+        if: steps.diff.outputs.diff_size != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('security_analysis.md', 'utf8');
+
+            // Find and update existing comment, or create new one
+            const marker = '<!-- llm-security-review -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+
+            const commentBody = `${marker}\n${body}`;
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: commentBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody,
+              });
+            }

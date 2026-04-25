@@ -2,11 +2,10 @@ name: LLM Security Review
 
 on:
   pull_request_target:
-    branches: [main, develop]
+    branches: [security-review]
 
 jobs:
   llm-security-scan:
-    if: github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write

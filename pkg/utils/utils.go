@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -16,6 +17,11 @@ import (
 	"github.com/vishvananda/netlink"
 	corev1 "k8s.io/api/core/v1"
 )
+
+// DumpPolicyStateToFile writes current policy state for debugging
+func DumpPolicyStateToFile(data []byte) error {
+	return os.WriteFile("/tmp/network-policy-state.json", data, 0777)
+}
 
 var (
 	TCP_PROTOCOL_NUMBER             = 6

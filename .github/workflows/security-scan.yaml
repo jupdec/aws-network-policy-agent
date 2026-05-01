@@ -10,6 +10,7 @@ jobs:
     permissions:
       pull-requests: write
       contents: read
+      id-token: write
 
     steps:
       - name: Checkout base branch
@@ -33,23 +34,28 @@ jobs:
         if: steps.diff.outputs.diff_size == '0'
         run: echo "No relevant code changes found. Skipping security scan."
 
+      - name: Configure AWS credentials
+        if: steps.diff.outputs.diff_size != '0'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711387134148:role/github-llm-security-scan
+          aws-region: us-west-2
+
       - name: Run LLM Security Analysis
         if: steps.diff.outputs.diff_size != '0'
-        env:
-          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+        id: analysis
         run: |
+          pip install -q boto3
           python3 << 'PYEOF'
-          import os, json, sys, urllib.request
+          import os, json, sys, boto3
 
-          diff_path = "pr_diff.txt"
-          with open(diff_path) as f:
+          with open("pr_diff.txt") as f:
               diff = f.read()
 
           if not diff.strip():
               print("Empty diff, nothing to analyze.")
               sys.exit(0)
 
-          # Truncate if too large (keep within token limits)
           max_chars = 30000
           truncated = False
           if len(diff) > max_chars:
@@ -87,49 +93,33 @@ jobs:
           {diff}
           ```"""
 
-          region = "us-west-2"
-          model_id = "us.anthropic.claude-sonnet-4-6"
-          url = f"https://bedrock-runtime.{region}.amazonaws.com/model/{model_id}/converse"
-
-          payload = json.dumps({
-              "messages": [{"role": "user", "content": [{"text": prompt}]}],
-              "inferenceConfig": {"maxTokens": 4096},
-          }).encode()
-
-          req = urllib.request.Request(
-              url,
-              data=payload,
-              headers={
-                  "Content-Type": "application/json",
-                  "Authorization": f"Bearer {os.environ['AWS_BEARER_TOKEN_BEDROCK']}",
-              },
-              method="POST",
+          client = boto3.client("bedrock-runtime", region_name="us-west-2")
+          response = client.invoke_model(
+              modelId="us.anthropic.claude-sonnet-4-6",
+              contentType="application/json",
+              accept="application/json",
+              body=json.dumps({
+                  "anthropic_version": "bedrock-2023-05-31",
+                  "max_tokens": 4096,
+                  "messages": [{"role": "user", "content": prompt}]
+              }),
           )
 
-          try:
-              with urllib.request.urlopen(req, timeout=120) as resp:
-                  body = json.loads(resp.read())
-          except urllib.error.HTTPError as e:
-              print(f"API error {e.code}: {e.read().decode()}", file=sys.stderr)
-              sys.exit(1)
+          body = json.loads(response["body"].read())
+          analysis = body["content"][0]["text"]
 
-          analysis = body["output"]["message"]["content"][0]["text"]
-
-          # Write analysis to file for the comment step
           with open("security_analysis.md", "w") as f:
               f.write("## 🔒 LLM Security Review\n\n")
               f.write(analysis)
               if truncated:
                   f.write("\n\n---\n⚠️ *Diff was truncated. Large PRs may have unreviewed sections.*\n")
 
-          # Determine if issues were found (for status check)
           has_issues = "no security issues detected" not in analysis.lower()
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write(f"has_issues={'true' if has_issues else 'false'}\n")
 
           print(analysis)
           PYEOF
-        id: analysis
 
       - name: Comment PR with results
         if: steps.diff.outputs.diff_size != '0'
@@ -139,7 +129,6 @@ jobs:
             const fs = require('fs');
             const body = fs.readFileSync('security_analysis.md', 'utf8');
 
-            // Find and update existing comment, or create new one
             const marker = '<!-- llm-security-review -->';
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,

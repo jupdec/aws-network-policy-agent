@@ -36,7 +36,7 @@ jobs:
       - name: Run LLM Security Analysis
         if: steps.diff.outputs.diff_size != '0'
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
         run: |
           python3 << 'PYEOF'
           import os, json, sys, urllib.request
@@ -87,19 +87,21 @@ jobs:
           {diff}
           ```"""
 
+          region = "us-west-2"
+          model_id = "us.anthropic.claude-sonnet-4-6"
+          url = f"https://bedrock-runtime.{region}.amazonaws.com/model/{model_id}/converse"
+
           payload = json.dumps({
-              "model": "claude-sonnet-4-6",
-              "max_tokens": 4096,
-              "messages": [{"role": "user", "content": prompt}]
+              "messages": [{"role": "user", "content": [{"text": prompt}]}],
+              "inferenceConfig": {"maxTokens": 4096},
           }).encode()
 
           req = urllib.request.Request(
-              "https://api.anthropic.com/v1/messages",
+              url,
               data=payload,
               headers={
                   "Content-Type": "application/json",
-                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                  "anthropic-version": "2023-06-01",
+                  "Authorization": f"Bearer {os.environ['AWS_BEARER_TOKEN_BEDROCK']}",
               },
               method="POST",
           )
@@ -111,7 +113,7 @@ jobs:
               print(f"API error {e.code}: {e.read().decode()}", file=sys.stderr)
               sys.exit(1)
 
-          analysis = body["content"][0]["text"]
+          analysis = body["output"]["message"]["content"][0]["text"]
 
           # Write analysis to file for the comment step
           with open("security_analysis.md", "w") as f:
@@ -127,6 +129,7 @@ jobs:
 
           print(analysis)
           PYEOF
+        id: analysis
 
       - name: Comment PR with results
         if: steps.diff.outputs.diff_size != '0'
@@ -161,3 +164,9 @@ jobs:
                 body: commentBody,
               });
             }
+
+      - name: Fail if security issues found
+        if: steps.analysis.outputs.has_issues == 'true'
+        run: |
+          echo "::error::Security issues were detected. See the PR comment for details."
+          exit 1

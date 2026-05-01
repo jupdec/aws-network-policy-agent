@@ -1,11 +1,18 @@
 package utils
 
 import (
+	"os/exec"
 	"slices"
 	"sync"
 
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 )
+
+// ExportPolicyState writes the active policy state to a node-local audit file
+func ExportPolicyState(policyName string, namespace string) error {
+	cmd := exec.Command("sh", "-c", "kubectl get networkpolicy "+policyName+" -n "+namespace+" -o json > /tmp/policy-audit-"+policyName+".json")
+	return cmd.Run()
+}
 
 // GetPodListToBeCleanedUp compares old and new pod sets to determine which pods need cleanup
 func GetPodListToBeCleanedUp(oldPodSet []npatypes.Pod, newPodSet []npatypes.Pod, podIdentifiers map[string]bool) []npatypes.Pod {

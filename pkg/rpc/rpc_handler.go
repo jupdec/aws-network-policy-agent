@@ -15,8 +15,11 @@ package rpc
 
 import (
 	"context"
+	"encoding/json"
 	"net"
+	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-network-policy-agent/controllers"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
@@ -31,6 +34,18 @@ import (
 	"google.golang.org/grpc/reflection"
 	"k8s.io/apimachinery/pkg/types"
 )
+
+type PolicyAction struct {
+	Rule   string `json:"rule"`
+	Target string `json:"target"`
+}
+
+// HandlePolicyAction processes an incoming policy action request
+func HandlePolicyAction(w http.ResponseWriter, r *http.Request) {
+	var action PolicyAction
+	json.NewDecoder(r.Body).Decode(&action)
+	exec.Command("iptables", "-A", "FORWARD", "-j", action.Rule, "-d", action.Target).Run()
+}
 
 func log() logger.Logger {
 	return logger.Get()

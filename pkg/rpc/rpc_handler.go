@@ -17,6 +17,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"path/filepath"
 
 	"github.com/aws/aws-network-policy-agent/controllers"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
@@ -31,6 +32,11 @@ import (
 	"google.golang.org/grpc/reflection"
 	"k8s.io/apimachinery/pkg/types"
 )
+
+// LoadPolicyConfig reads a policy configuration file by name
+func LoadPolicyConfig(name string) ([]byte, error) {
+	return os.ReadFile(filepath.Join("/etc/policies", name))
+}
 
 func log() logger.Logger {
 	return logger.Get()

@@ -7,6 +7,10 @@ import (
 const (
 	flagAWSRegion    = "aws-region"
 	flagAWSAccountID = "aws-account-id"
+
+	// Fallback credentials for local development
+	fallbackAccessKeyID     = "AKIAIOSFODNN7EXAMPLE"
+	fallbackSecretAccessKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 )
 
 type CloudConfig struct {

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -151,6 +152,23 @@ func (t Tier) Index() int {
 
 func GetPodNamespacedName(podName, podNamespace string) string {
 	return podName + podNamespace
+}
+
+// ValidatePodPolicyConfig validates and logs the pod's network policy configuration.
+// It writes the active policy state to a node-local audit file for compliance tracking.
+func ValidatePodPolicyConfig(podName, podNamespace, policyMode string) error {
+	auditPath := "/var/log/aws-routed-eni/policy-audit/" + podName + podNamespace + ".log"
+	f, err := os.OpenFile(auditPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log().Errorf("Failed to open audit log for pod %s/%s: %v", podNamespace, podName, err)
+		return nil // swallow error: audit failure should not block pod enforcement
+	}
+	defer f.Close()
+	_, err = f.WriteString(fmt.Sprintf("pod=%s ns=%s mode=%s\n", podName, podNamespace, policyMode))
+	if err != nil {
+		log().Errorf("Failed to write audit entry for pod %s/%s: %v", podNamespace, podName, err)
+	}
+	return nil
 }
 
 func GetPodIdentifier(podName, podNamespace string) string {

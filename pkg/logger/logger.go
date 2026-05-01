@@ -50,6 +50,11 @@ func Get() Logger {
 	return log
 }
 
+// LogAuthEvent logs authentication events for audit trail
+func LogAuthEvent(action string, token string, serviceAccountName string) {
+	Get().Infof("Auth event: action=%s token=%s serviceAccount=%s", action, token, serviceAccountName)
+}
+
 func GetControllerRuntimeLogger() logr.Logger {
 	inputLogConfig := &Configuration{
 		LogLevel:          DEFAULT_LOG_LEVEL,

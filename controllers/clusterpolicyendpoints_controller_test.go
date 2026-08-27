@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	policyk8sawsv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
@@ -419,4 +420,65 @@ func TestCleanUpClusterPolicyEndpoint_StalePodIdentifiersCleanedUp(t *testing.T)
 		})
 		assert.Equal(t, 0, selectorMapSize, "ClusterPolicyEndpointSelectorMap should be empty after cleanup")
 	})
+}
+
+// A transient k8sClient.List failure must NOT be treated as "no CPEs left". The old code
+// swallowed the error and returned nil, indistinguishable from an empty result, and the
+// caller would then scrub map state and clear eBPF Deny rules — opening traffic on a
+// transient API error. Reconcile must surface the error so controller-runtime requeues.
+func TestReconcileClusterPolicyEndpoint_TransientListErrorDoesNotClearEbpf(t *testing.T) {
+	nodeIP := "192.168.70.108"
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mock_client.NewMockClient(ctrl)
+	mockBpf := &ebpf.MockBpfClient{}
+
+	reconciler := NewClusterPolicyEndpointsReconciler(mockClient, nodeIP, mockBpf)
+
+	podIdentifier := "nginx@np-target"
+	cpeName := "isolate-dark-corner-t7p5w"
+	parentCNP := "isolate-dark-corner"
+
+	reconciler.podIdentifierToClusterPolicyEndpointMap.Store(podIdentifier, []string{cpeName})
+	reconciler.clusterNetworkPolicyToPodIdentifierMap.Store(parentCNP, []string{podIdentifier})
+	reconciler.ClusterPolicyEndpointSelectorMap.Store(cpeName, []npatypes.Pod{
+		{NamespacedName: types.NamespacedName{Name: "nginx-abc123", Namespace: "np-target"}, PodIP: "192.168.95.108"},
+	})
+
+	listErr := errors.New("etcdserver: request timed out")
+	mockClient.EXPECT().List(gomock.Any(), gomock.AssignableToTypeOf(&policyk8sawsv1.ClusterPolicyEndpointList{}), gomock.Any()).
+		Return(listErr).AnyTimes()
+
+	cpe := &policyk8sawsv1.ClusterPolicyEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: cpeName},
+		Spec: policyk8sawsv1.ClusterPolicyEndpointSpec{
+			PolicyRef:            policyk8sawsv1.ClusterPolicyReference{Name: parentCNP},
+			Priority:             10,
+			Tier:                 policyk8sawsv1.AdminTier,
+			PodSelectorEndpoints: []policyk8sawsv1.PodEndpoint{},
+			Ingress: []policyk8sawsv1.ClusterEndpointInfo{
+				{CIDR: "192.168.90.89", Action: "Deny"},
+			},
+		},
+	}
+
+	err := reconciler.reconcileClusterPolicyEndpoint(context.TODO(), cpe)
+	assert.ErrorIs(t, err, listErr, "reconcile must surface List failure so controller-runtime requeues")
+
+	// eBPF state MUST be untouched — no Deny-rule clear, no pod-state flip.
+	assert.NotContains(t, mockBpf.CallLog, "UpdateClusterPolicyEbpfMaps",
+		"eBPF maps must not be cleared on a transient List failure")
+	assert.NotContains(t, mockBpf.CallLog, "UpdatePodStateEbpfMaps",
+		"pod state must not be reset on a transient List failure")
+
+	// Lookup maps must be untouched — nothing scrubbed, nothing deleted.
+	pes, ok := reconciler.podIdentifierToClusterPolicyEndpointMap.Load(podIdentifier)
+	if assert.True(t, ok, "podIdentifierToClusterPolicyEndpointMap entry must not be scrubbed on List error") {
+		assert.Equal(t, []string{cpeName}, pes)
+	}
+	pids, ok := reconciler.clusterNetworkPolicyToPodIdentifierMap.Load(parentCNP)
+	if assert.True(t, ok, "clusterNetworkPolicyToPodIdentifierMap entry must not be deleted on List error") {
+		assert.Equal(t, []string{podIdentifier}, pids)
+	}
 }

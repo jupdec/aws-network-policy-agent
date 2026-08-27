@@ -16,6 +16,7 @@ import (
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/ipamd/datastore"
 	goelf "github.com/aws/aws-ebpf-sdk-go/pkg/elfparser"
 	goebpfmaps "github.com/aws/aws-ebpf-sdk-go/pkg/maps"
+	goebpfmetrics "github.com/aws/aws-ebpf-sdk-go/pkg/metrics"
 	"github.com/aws/aws-ebpf-sdk-go/pkg/tc"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf/conntrack"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf/events"
@@ -80,6 +81,27 @@ var (
 		},
 		[]string{"fn"},
 	)
+
+	// The SDK retries BPF_PROG_LOAD on EAGAIN (verifier interrupted by a pending
+	// signal) transparently, so successful retries are
+	// invisible to sdkAPIErr. These CounterFuncs read the SDK's process-wide
+	// atomic counters so the race stays observable on the agent's /metrics.
+	sdkProgLoadEAGAINRetries = prometheus.NewCounterFunc(
+		prometheus.CounterOpts{
+			Name: "awsnodeagent_aws_ebpfsdk_prog_load_eagain_retries_total",
+			Help: "Cumulative BPF_PROG_LOAD attempts retried by the SDK after the verifier returned EAGAIN",
+		},
+		func() float64 { return float64(goebpfmetrics.ProgLoadEAGAINRetries()) },
+	)
+
+	sdkProgLoadEAGAINExhausted = prometheus.NewCounterFunc(
+		prometheus.CounterOpts{
+			Name: "awsnodeagent_aws_ebpfsdk_prog_load_eagain_exhausted_total",
+			Help: "Cumulative BPF_PROG_LOAD calls that exhausted all SDK retries on EAGAIN and were left unattached (enforcement gaps)",
+		},
+		func() float64 { return float64(goebpfmetrics.ProgLoadEAGAINExhausted()) },
+	)
+
 	prometheusRegistered = false
 )
 
@@ -95,6 +117,8 @@ func prometheusRegister() {
 	if !prometheusRegistered {
 		metrics.Registry.MustRegister(sdkAPILatency)
 		metrics.Registry.MustRegister(sdkAPIErr)
+		metrics.Registry.MustRegister(sdkProgLoadEAGAINRetries)
+		metrics.Registry.MustRegister(sdkProgLoadEAGAINExhausted)
 		prometheusRegistered = true
 	}
 }

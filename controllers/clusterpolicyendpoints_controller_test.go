@@ -8,6 +8,7 @@ import (
 	mock_client "github.com/aws/aws-network-policy-agent/mocks/controller-runtime/client"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
+	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -210,6 +211,91 @@ func TestReconcileClusterPolicyEndpoint_StalePodIdentifiersClearedFromEbpf(t *te
 		assert.Contains(t, mockBpf.CallLog, "UpdateClusterPolicyEbpfMaps")
 		assert.Empty(t, mockBpf.LastClusterPolicyIngressRules,
 			"sibling CPE must not re-supply Deny rules for a stale identifier")
+	})
+
+	t.Run("truncated CPE name still triggers stale cleanup", func(t *testing.T) {
+		// For CNP names >= 58 chars GenerateName truncates the CPE base, so the write
+		// key must be derived from the CPE name (same as the reader) rather than
+		// Spec.PolicyRef.Name — else stale cleanup silently re-derives Deny rules.
+		mockClient := mock_client.NewMockClient(ctrl)
+		mockBpf := &ebpf.MockBpfClient{}
+
+		reconciler := NewClusterPolicyEndpointsReconciler(mockClient, nodeIP, mockBpf)
+
+		parentCNP := "restrict-egress-from-payment-service-to-external-endpoints-prod"
+		cpeName := "restrict-egress-from-payment-service-to-external-endpoints-abcde"
+		podName := "nginx-abc123"
+		podNamespace := "np-target"
+		podIdentifier := "nginx@np-target"
+
+		var currentCPE *policyk8sawsv1.ClusterPolicyEndpoint
+		mockClient.EXPECT().List(gomock.Any(), gomock.AssignableToTypeOf(&policyk8sawsv1.ClusterPolicyEndpointList{}), gomock.Any()).DoAndReturn(
+			func(ctx context.Context, list *policyk8sawsv1.ClusterPolicyEndpointList, opts ...client.ListOption) error {
+				*list = policyk8sawsv1.ClusterPolicyEndpointList{Items: []policyk8sawsv1.ClusterPolicyEndpoint{*currentCPE}}
+				return nil
+			},
+		).AnyTimes()
+		mockClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+				if cpObj, ok := obj.(*policyk8sawsv1.ClusterPolicyEndpoint); ok {
+					*cpObj = *currentCPE
+				}
+				return nil
+			},
+		).AnyTimes()
+
+		// Reconcile #1: pod selected — writes clusterNetworkPolicyToPodIdentifierMap.
+		currentCPE = &policyk8sawsv1.ClusterPolicyEndpoint{
+			ObjectMeta: metav1.ObjectMeta{Name: cpeName},
+			Spec: policyk8sawsv1.ClusterPolicyEndpointSpec{
+				PolicyRef: policyk8sawsv1.ClusterPolicyReference{Name: parentCNP},
+				Priority:  10,
+				Tier:      policyk8sawsv1.AdminTier,
+				PodSelectorEndpoints: []policyk8sawsv1.PodEndpoint{
+					{
+						HostIP:    policyk8sawsv1.NetworkAddress(nodeIP),
+						PodIP:     "192.168.95.108",
+						Name:      podName,
+						Namespace: podNamespace,
+					},
+				},
+				Ingress: []policyk8sawsv1.ClusterEndpointInfo{
+					{CIDR: "192.168.90.89", Action: "Deny"},
+				},
+			},
+		}
+		err := reconciler.reconcileClusterPolicyEndpoint(context.TODO(), currentCPE)
+		assert.Nil(t, err)
+
+		// Reconcile #2: label removed — CPE still exists but selects no pods.
+		currentCPE = &policyk8sawsv1.ClusterPolicyEndpoint{
+			ObjectMeta: metav1.ObjectMeta{Name: cpeName},
+			Spec: policyk8sawsv1.ClusterPolicyEndpointSpec{
+				PolicyRef:            policyk8sawsv1.ClusterPolicyReference{Name: parentCNP},
+				Priority:             10,
+				Tier:                 policyk8sawsv1.AdminTier,
+				PodSelectorEndpoints: []policyk8sawsv1.PodEndpoint{},
+				Ingress: []policyk8sawsv1.ClusterEndpointInfo{
+					{CIDR: "192.168.90.89", Action: "Deny"},
+				},
+			},
+		}
+		mockBpf.CallLog = nil
+		mockBpf.LastClusterPolicyIngressRules = nil
+		err = reconciler.reconcileClusterPolicyEndpoint(context.TODO(), currentCPE)
+		assert.Nil(t, err)
+
+		_, ok := reconciler.podIdentifierToClusterPolicyEndpointMap.Load(podIdentifier)
+		assert.False(t, ok, "stale identifier should be removed even when the CPE name is truncated")
+
+		// Rule count is what distinguishes "clear" from "re-derive" — both branches call
+		// UpdateClusterPolicyEbpfMaps.
+		assert.Contains(t, mockBpf.CallLog, "UpdateClusterPolicyEbpfMaps")
+		assert.Empty(t, mockBpf.LastClusterPolicyIngressRules,
+			"Deny rules must be cleared, not re-derived")
+
+		_, ok = reconciler.clusterNetworkPolicyToPodIdentifierMap.Load(utils.GetParentNPNameFromPEName(cpeName))
+		assert.False(t, ok)
 	})
 
 	t.Run("active pod identifiers keep rules applied when there are no stale identifiers", func(t *testing.T) {

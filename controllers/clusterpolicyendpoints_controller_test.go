@@ -420,6 +420,59 @@ func TestCleanUpClusterPolicyEndpoint_StalePodIdentifiersCleanedUp(t *testing.T)
 		})
 		assert.Equal(t, 0, selectorMapSize, "ClusterPolicyEndpointSelectorMap should be empty after cleanup")
 	})
+
+	// When the deleted CPE has siblings under the same parent, the sibling names are in
+	// parentCPEList but the deleted CPE's name isn't — so the scrub loop in
+	// deriveTargetPodsForParentCNP wouldn't remove it. Its dangling name keeps the
+	// identifier entry alive and defeats the HasBPFContext guard: cleanupClusterPolicyPod
+	// takes the "sibling still applies" branch and calls UpdateClusterPolicyEbpfMaps on
+	// a detached context. cleanUpClusterPolicyEndpoint must scrub resourceName from every
+	// affected identifier explicitly.
+	t.Run("deleted CPE removed from identifier map when siblings exist", func(t *testing.T) {
+		mockClient := mock_client.NewMockClient(ctrl)
+		mockBpf := &ebpf.MockBpfClient{}
+
+		reconciler := NewClusterPolicyEndpointsReconciler(mockClient, nodeIP, mockBpf)
+
+		podIdentifier := "nginx@np-target"
+		deletedCPE := "isolate-dark-corner-t7p5w"
+		siblingCPE := "isolate-dark-corner-x9k4m"
+		parentCNP := "isolate-dark-corner"
+
+		reconciler.podIdentifierToClusterPolicyEndpointMap.Store(podIdentifier, []string{deletedCPE, siblingCPE})
+		reconciler.clusterNetworkPolicyToPodIdentifierMap.Store(parentCNP, []string{podIdentifier})
+		reconciler.ClusterPolicyEndpointSelectorMap.Store(deletedCPE, []npatypes.Pod{
+			{NamespacedName: types.NamespacedName{Name: "nginx-abc123", Namespace: "np-target"}, PodIP: "192.168.95.108"},
+		})
+
+		// List returns only the sibling — the deleted CPE is gone from etcd.
+		siblingObj := policyk8sawsv1.ClusterPolicyEndpoint{
+			ObjectMeta: metav1.ObjectMeta{Name: siblingCPE},
+			Spec: policyk8sawsv1.ClusterPolicyEndpointSpec{
+				PolicyRef:            policyk8sawsv1.ClusterPolicyReference{Name: parentCNP},
+				Priority:             10,
+				Tier:                 policyk8sawsv1.AdminTier,
+				PodSelectorEndpoints: []policyk8sawsv1.PodEndpoint{}, // sibling selects nothing on this node
+			},
+		}
+		mockClient.EXPECT().List(gomock.Any(), gomock.AssignableToTypeOf(&policyk8sawsv1.ClusterPolicyEndpointList{}), gomock.Any()).DoAndReturn(
+			func(ctx context.Context, list *policyk8sawsv1.ClusterPolicyEndpointList, opts ...client.ListOption) error {
+				*list = policyk8sawsv1.ClusterPolicyEndpointList{Items: []policyk8sawsv1.ClusterPolicyEndpoint{siblingObj}}
+				return nil
+			},
+		).AnyTimes()
+
+		err := reconciler.cleanUpClusterPolicyEndpoint(context.TODO(), controllerruntime.Request{
+			NamespacedName: types.NamespacedName{Name: deletedCPE},
+		})
+		assert.Nil(t, err)
+
+		// deletedCPE must be gone from the identifier's list.
+		if v, ok := reconciler.podIdentifierToClusterPolicyEndpointMap.Load(podIdentifier); ok {
+			assert.NotContains(t, v.([]string), deletedCPE,
+				"deleted CPE must not linger in podIdentifierToClusterPolicyEndpointMap when siblings exist")
+		}
+	})
 }
 
 // A transient k8sClient.List failure must NOT be treated as "no CPEs left". The old code

@@ -140,6 +140,18 @@ func (r *ClusterPolicyEndpointsReconciler) cleanUpClusterPolicyEndpoint(ctx cont
 		return err
 	}
 
+	// deriveTargetPodsForParentCNP scrubs only the parent's *remaining* CPEs from stale
+	// identifiers. When siblings exist the deleted CPE is not in that list, so its name
+	// keeps the identifier entry alive and cleanupClusterPolicyPod would attempt an eBPF
+	// update on a detached context instead of taking the HasBPFContext-guarded clear path.
+	// Scrub it explicitly before cleanup runs.
+	if existingPods, ok := r.ClusterPolicyEndpointSelectorMap.Load(resourceName); ok {
+		for _, pod := range existingPods.([]npatypes.Pod) {
+			podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
+			utils.DeletePolicyEndpointFromPodIdentifierMap(&r.podIdentifierToClusterPolicyEndpointMap, &r.podIdentifierToClusterPolicyEndpointMapMutex, podIdentifier, resourceName)
+		}
+	}
+
 	log().Infof("cleanUpClusterPolicyEndpoint: Pods to cleanup - %d and Pods to be updated - %d", len(podsToBeCleanedUp), len(targetPods))
 
 	if len(targetPods) > 0 {

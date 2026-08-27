@@ -473,6 +473,94 @@ func TestCleanUpClusterPolicyEndpoint_StalePodIdentifiersCleanedUp(t *testing.T)
 				"deleted CPE must not linger in podIdentifierToClusterPolicyEndpointMap when siblings exist")
 		}
 	})
+
+	// getClusterPolicyEndpointsOfParentCNP used to filter by exact Spec.PolicyRef.Name.
+	// For CNP names >=58 chars GenerateName truncates the CPE base, so PolicyRef.Name (full
+	// CNP name) differs from the stripped CPE-name derivation the identifier map keys with.
+	// On delete of one CPE, the filter would miss the surviving sibling and drive
+	// deriveTargetPodsForParentCNP into the "no CPEs left" branch — wiping the sibling's
+	// Deny rules on the pod. Must match by stripped-name equality instead.
+	t.Run("long-name CNP: deleting one CPE preserves sibling Deny rules", func(t *testing.T) {
+		mockClient := mock_client.NewMockClient(ctrl)
+		mockBpf := &ebpf.MockBpfClient{}
+
+		reconciler := NewClusterPolicyEndpointsReconciler(mockClient, nodeIP, mockBpf)
+
+		podName := "nginx-abc123"
+		podNamespace := "np-target"
+		podIdentifier := "nginx@np-target"
+		parentCNP := "restrict-egress-from-payment-service-to-external-endpoints-prod"
+		deletedCPE := "restrict-egress-from-payment-service-to-external-endpoints-aaaaa"
+		siblingCPE := "restrict-egress-from-payment-service-to-external-endpoints-bbbbb"
+		parentKey := utils.GetParentNPNameFromPEName(deletedCPE)
+
+		reconciler.podIdentifierToClusterPolicyEndpointMap.Store(podIdentifier, []string{deletedCPE, siblingCPE})
+		reconciler.clusterNetworkPolicyToPodIdentifierMap.Store(parentKey, []string{podIdentifier})
+		reconciler.ClusterPolicyEndpointSelectorMap.Store(deletedCPE, []npatypes.Pod{
+			{NamespacedName: types.NamespacedName{Name: podName, Namespace: podNamespace}, PodIP: "192.168.95.108"},
+		})
+		reconciler.ClusterPolicyEndpointSelectorMap.Store(siblingCPE, []npatypes.Pod{
+			{NamespacedName: types.NamespacedName{Name: podName, Namespace: podNamespace}, PodIP: "192.168.95.108"},
+		})
+
+		// List returns only the sibling — full PolicyRef.Name (>=58 chars) on both CPEs.
+		siblingObj := policyk8sawsv1.ClusterPolicyEndpoint{
+			ObjectMeta: metav1.ObjectMeta{Name: siblingCPE},
+			Spec: policyk8sawsv1.ClusterPolicyEndpointSpec{
+				PolicyRef: policyk8sawsv1.ClusterPolicyReference{Name: parentCNP},
+				Priority:  10,
+				Tier:      policyk8sawsv1.AdminTier,
+				PodSelectorEndpoints: []policyk8sawsv1.PodEndpoint{
+					{
+						HostIP:    policyk8sawsv1.NetworkAddress(nodeIP),
+						PodIP:     "192.168.95.108",
+						Name:      podName,
+						Namespace: podNamespace,
+					},
+				},
+				Ingress: []policyk8sawsv1.ClusterEndpointInfo{
+					{CIDR: "192.168.90.89", Action: "Deny"},
+				},
+			},
+		}
+		mockClient.EXPECT().List(gomock.Any(), gomock.AssignableToTypeOf(&policyk8sawsv1.ClusterPolicyEndpointList{}), gomock.Any()).DoAndReturn(
+			func(ctx context.Context, list *policyk8sawsv1.ClusterPolicyEndpointList, opts ...client.ListOption) error {
+				*list = policyk8sawsv1.ClusterPolicyEndpointList{Items: []policyk8sawsv1.ClusterPolicyEndpoint{siblingObj}}
+				return nil
+			},
+		).AnyTimes()
+		mockClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+				if cpObj, ok := obj.(*policyk8sawsv1.ClusterPolicyEndpoint); ok {
+					*cpObj = siblingObj
+				}
+				return nil
+			},
+		).AnyTimes()
+
+		err := reconciler.cleanUpClusterPolicyEndpoint(context.TODO(), controllerruntime.Request{
+			NamespacedName: types.NamespacedName{Name: deletedCPE},
+		})
+		assert.Nil(t, err)
+
+		// The pod is still targeted by siblingCPE — its Deny rule must NOT be wiped.
+		// Pre-fix: getClusterPolicyEndpointsOfParentCNP misses siblingCPE, falls into the
+		// "no CPEs left" branch, cleanupClusterPolicyPod skips siblingCPE via the same-parent
+		// filter, and updateClusterPolicyBPFMaps(nil, nil) clears the eBPF Deny.
+		require := assert.New(t)
+		if !require.NotEmpty(mockBpf.LastClusterPolicyIngressRules,
+			"sibling's Deny rules must not be wiped when a long-name CPE is deleted") {
+			return
+		}
+		assert.EqualValues(t, "192.168.90.89", mockBpf.LastClusterPolicyIngressRules[0].IPCidr)
+
+		// The pod's identifier entry must retain the sibling (deletedCPE scrubbed).
+		v, ok := reconciler.podIdentifierToClusterPolicyEndpointMap.Load(podIdentifier)
+		if assert.True(t, ok, "sibling CPE must keep identifier entry alive") {
+			assert.Contains(t, v.([]string), siblingCPE)
+			assert.NotContains(t, v.([]string), deletedCPE)
+		}
+	})
 }
 
 // A transient k8sClient.List failure must NOT be treated as "no CPEs left". The old code

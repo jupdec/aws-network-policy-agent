@@ -131,11 +131,11 @@ func (r *ClusterPolicyEndpointsReconciler) cleanUpClusterPolicyEndpoint(ctx cont
 
 	r.lastObservedTriggerTimes.Delete(req.Name)
 
-	parentCNPName := utils.GetParentNPNameFromPEName(req.Name)
 	resourceName := req.Name
+	parentKey := utils.GetParentNPNameFromPEName(resourceName)
 
 	targetPods, targetPodIdentifiers, podsToBeCleanedUp, parentCPEList, err :=
-		r.deriveTargetPodsForParentCNP(ctx, parentCNPName, resourceName)
+		r.deriveTargetPodsForParentCNP(ctx, parentKey, resourceName)
 	if err != nil {
 		return err
 	}
@@ -176,11 +176,11 @@ func (r *ClusterPolicyEndpointsReconciler) cleanUpClusterPolicyEndpoint(ctx cont
 func (r *ClusterPolicyEndpointsReconciler) reconcileClusterPolicyEndpoint(ctx context.Context, ClusterPolicyEndpoint *policyk8sawsv1.ClusterPolicyEndpoint) error {
 	log().Infof("Processing Cluster Policy Endpoint Name: %s", ClusterPolicyEndpoint.Name)
 
-	parentCNPName := ClusterPolicyEndpoint.Spec.PolicyRef.Name
 	resourceName := ClusterPolicyEndpoint.Name
+	parentKey := utils.GetParentNPNameFromPEName(resourceName)
 
 	targetPods, targetPodIdentifiers, podsToBeCleanedUp, parentCPEList, err :=
-		r.deriveTargetPodsForParentCNP(ctx, parentCNPName, resourceName)
+		r.deriveTargetPodsForParentCNP(ctx, parentKey, resourceName)
 	if err != nil {
 		return err
 	}
@@ -383,7 +383,7 @@ func (r *ClusterPolicyEndpointsReconciler) deriveClusterPolicyIngressAndEgressFi
 // only sees sibling CPEs from OTHER parents. Leaves ClusterPolicyEndpointSelectorMap and
 // clusterNetworkPolicyToPodIdentifierMap untouched — the caller commits those AFTER cleanup
 // via commitClusterPolicyEndpointState so a failed cleanup can be retried.
-func (r *ClusterPolicyEndpointsReconciler) deriveTargetPodsForParentCNP(ctx context.Context, parentCNPName, resourceName string) ([]npatypes.Pod, map[string]bool, []npatypes.Pod, []string, error) {
+func (r *ClusterPolicyEndpointsReconciler) deriveTargetPodsForParentCNP(ctx context.Context, parentKey, resourceName string) ([]npatypes.Pod, map[string]bool, []npatypes.Pod, []string, error) {
 	var newTargetPods []npatypes.Pod
 	var podsToBeCleanedUp []npatypes.Pod
 	var parentCPEList []string
@@ -396,11 +396,11 @@ func (r *ClusterPolicyEndpointsReconciler) deriveTargetPodsForParentCNP(ctx cont
 		currentPods = append(currentPods, existingPods.([]npatypes.Pod)...)
 	}
 
-	parentCPEObjects, err := r.getClusterPolicyEndpointsOfParentCNP(ctx, parentCNPName)
+	parentCPEObjects, err := r.getClusterPolicyEndpointsOfParentCNP(ctx, parentKey)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	log().Infof("Parent Cluster Network Policy resource Name: %s Total Cluster Policy Endpoints for Parent CNP: Count: %d", parentCNPName, len(parentCPEObjects))
+	log().Infof("Parent Cluster Network Policy key: %s Total Cluster Policy Endpoints for Parent CNP: Count: %d", parentKey, len(parentCPEObjects))
 
 	if len(parentCPEObjects) == 0 {
 		podsToBeCleanedUp = append(podsToBeCleanedUp, currentPods...)
@@ -523,11 +523,15 @@ func (r *ClusterPolicyEndpointsReconciler) commitClusterPolicyEndpointState(
 	r.clusterNetworkPolicyToPodIdentifierMap.Store(parentKey, pids)
 }
 
-// getClusterPolicyEndpointsOfParentCNP returns the CPEs whose PolicyRef.Name matches
-// parentCNP. Callers must distinguish an empty result from a List failure — passing a
-// nil slice to the "no CPEs left" branch would incorrectly clear eBPF Deny rules on a
-// transient API error and open traffic.
-func (r *ClusterPolicyEndpointsReconciler) getClusterPolicyEndpointsOfParentCNP(ctx context.Context, parentCNP string) ([]policyk8sawsv1.ClusterPolicyEndpoint, error) {
+// getClusterPolicyEndpointsOfParentCNP returns the sibling CPEs of the parent identified
+// by parentKey. parentKey MUST be the stripped-CPE-name derivation (GetParentNPNameFromPEName),
+// not Spec.PolicyRef.Name: for CNP names >=58 chars the API server truncates GenerateName,
+// so PolicyRef.Name and the stripped CPE name diverge. Matching on PolicyRef.Name would miss
+// every sibling and the caller would take the "no CPEs left" branch, wiping surviving Deny
+// rules. Filter uses the same stripped derivation the identifier map keys itself with.
+// Callers must distinguish an empty result from a List failure — a nil-on-error slice
+// dropped into the "no CPEs left" branch would clear eBPF rules on a transient API error.
+func (r *ClusterPolicyEndpointsReconciler) getClusterPolicyEndpointsOfParentCNP(ctx context.Context, parentKey string) ([]policyk8sawsv1.ClusterPolicyEndpoint, error) {
 	ClusterPolicyEndpointList := &policyk8sawsv1.ClusterPolicyEndpointList{}
 	// Cluster-scoped: no namespace filter
 	if err := r.k8sClient.List(ctx, ClusterPolicyEndpointList, &client.ListOptions{}); err != nil {
@@ -537,7 +541,7 @@ func (r *ClusterPolicyEndpointsReconciler) getClusterPolicyEndpointsOfParentCNP(
 
 	var parentClusterPolicyEndpoints []policyk8sawsv1.ClusterPolicyEndpoint
 	for _, ClusterPolicyEndpoint := range ClusterPolicyEndpointList.Items {
-		if ClusterPolicyEndpoint.Spec.PolicyRef.Name == parentCNP {
+		if utils.GetParentNPNameFromPEName(ClusterPolicyEndpoint.Name) == parentKey {
 			parentClusterPolicyEndpoints = append(parentClusterPolicyEndpoints, ClusterPolicyEndpoint)
 		}
 	}

@@ -409,7 +409,7 @@ func TestGetPodIdentifier(t *testing.T) {
 				podName:      "hello-udp-748dc8d996-fb8b2",
 				podNamespace: "default",
 			},
-			want: "hello-udp-748dc8d996@default",
+			want: "hello-udp-748dc8d996-fb8b2@default",
 		},
 	}
 	for _, tt := range tests {
@@ -455,7 +455,7 @@ func TestGetDotPodIdentifier(t *testing.T) {
 				podName:      "my.pod.name-udp-748dc8d996-fb8b2",
 				podNamespace: "default",
 			},
-			want: "my_pod_name-udp-748dc8d996@default",
+			want: "my_pod_name-udp-748dc8d996-fb8b2@default",
 		},
 	}
 	for _, tt := range tests {

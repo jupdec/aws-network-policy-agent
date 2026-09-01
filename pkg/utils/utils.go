@@ -170,21 +170,16 @@ func GetPodNamespacedName(podName, podNamespace string) string {
 	return podName + "_" + podNamespace
 }
 
-// Separator is "@" because it is illegal in DNS-1123 pod names and namespaces,
-// making the identifier injective on (podName-prefix, podNamespace). "@" also
-// keeps pin filenames parseable by aws-ebpf-sdk-go, which splits on the first
-// "_" to find the suffix boundary; using "_" here would shadow that split.
+// Identifier is per-pod: full podName plus "@" plus podNamespace. Separator "@"
+// is illegal in DNS-1123, keeping the pair injective. Dropping the last dash-
+// segment of the name would let an attacker-named pod share an identifier with
+// an unrelated NP-selected workload and inherit its rules.
 func GetPodIdentifier(podName, podNamespace string) string {
 	if strings.Contains(podName, ".") {
 		log().Debug("Replacing '.' character with '_' for pod pin path.")
 		podName = strings.Replace(podName, ".", "_", -1)
 	}
-	podIdentifierPrefix := podName
-	if strings.Contains(podName, "-") {
-		tmpName := strings.Split(podName, "-")
-		podIdentifierPrefix = strings.Join(tmpName[:len(tmpName)-1], "-")
-	}
-	return podIdentifierPrefix + "@" + podNamespace
+	return podName + "@" + podNamespace
 }
 
 // LegacyGetPodIdentifier replicates the pre-fix GetPodIdentifier algorithm

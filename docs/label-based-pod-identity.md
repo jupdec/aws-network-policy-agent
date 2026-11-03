@@ -19,15 +19,41 @@ Line numbers below refer to `4bf96cf`.
 | # | Change | State |
 |---|---|---|
 | 1 | `utils.PodIdentity` + tests | **Done** (`pkg/utils/podidentity.go`) |
-| 2 | Node-scoped pod cache | TODO |
-| 3 | `podidentity.Resolver` (labels → identity, pod → identity store) | TODO |
-| 4 | Replace `GetPodIdentifier` at every call site | TODO |
-| 5 | Bind policies only for local pods + selector match | TODO |
-| 6 | CNI ADD fast path via `Spec.PodSelector` | TODO |
-| 7 | Label-change handling | TODO |
-| 8 | Persist pod → identity across restart | TODO |
-| 9 | Pin migration name-prefix → label identity | TODO |
-| 10 | CLI `show` identity → labels | TODO |
+| 2 | Node-scoped pod cache | **Done** (`pkg/podidentity/cache.go`, `pkg/config/runtime_config.go`) |
+| 3 | `podidentity.Resolver` (cache first, live GET fallback, never the name) | **Done** (`pkg/podidentity/resolver.go`) |
+| 4 | Replace `GetPodIdentifier` at every call site | **Done**; guarded by `pkg/utils/podidentity_guard_test.go` |
+| 5 | Bind policies only for local pods + selector match | **Done** (`deriveTargetPods`, `deriveClusterPolicyTargetPods`) |
+| 6 | CNI ADD fast path via `Spec.PodSelector` | **Done** (`PodEnforcer.EnforceNewPod`, `bindLocalPodBySelector`) |
+| 7 | Label-change handling | **Done** (`PodIdentityReconciler`, `RepointBPFProbes`) |
+| 8 | Persist pod → identity across restart | **Done**, differently: see below |
+| 9 | Pin migration name-prefix → label identity | **Done**, differently: see below |
+| 10 | CLI `show` identity → labels | **Done** (`pkg/podidentity/snapshot.go`, `pkg/clihelper/show.go`) |
+
+Not done: passing `K8S_POD_UID` in the CNI request (optional; needs a vpc-cni proto change).
+
+### Where the implementation differs from the plan below
+
+- **Pod → identity record.** The eBPF client records which identity each pod's TC filters
+  point at (`AttachedPodIdentifier`), set on attach/move and cleared on CNI DEL. CNI DEL and
+  cleanup read it, so they work after the pod object is gone. No resolver-side store.
+- **Restart and upgrade (8, 9): a startup sweep instead of pin renames.** After the caches
+  sync, `IdentitySweep` moves every network-ready local pod onto its label identity:
+  load programs → bind (selector for namespaced policies, CPE membership with the pod IP for
+  cluster policies) → program maps → replace the pod's TC filters in place
+  (`tc filter replace`, which also adopts filters left by the previous agent). Reconcilers wait
+  for the first pass (`startupGate`). Once every pod has moved, `ReleaseUnusedPodIdentifiers`
+  deletes programs no pod uses: the name-prefix ones after an upgrade, and those of pods
+  deleted while the agent was down. It runs on every start, so there is no `formatV3` marker;
+  the older `-` → `@` migration still runs first.
+- **Labels unavailable at CNI ADD** gives the pod an *isolated* identity
+  (`utils.IsolatedPodIdentity`) in the mode default; the pod identity controller moves it once
+  its labels are readable.
+- **Relabels** are moved the same gapless way, then the pod's namespace (and the CPEs listing
+  it) are reconciled so old bindings are pruned. A pod whose attached identity differs from its
+  label identity is bound under neither until the move.
+- **Remote pods are not tracked at all**, so `networkPolicyToPodIdentifierMap` /
+  `clusterNetworkPolicyToPodIdentifierMap` hold local identities only (#613). Tests that pinned
+  cluster-wide tracking were rewritten.
 
 ## 1. Identity function: done
 

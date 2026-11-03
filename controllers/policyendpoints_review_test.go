@@ -258,7 +258,7 @@ func TestTrackFailedCleanups(t *testing.T) {
 
 	t.Run("failed cleanups join the tracked set and contribute their identifiers", func(t *testing.T) {
 		ids := map[string]bool{identifierOf("web-aaa"): true}
-		pods, tracked := trackFailedCleanups(targets, failed, ids)
+		pods, tracked := trackFailedCleanups(targets, failed, ids, nameIdentity)
 
 		assert.ElementsMatch(t, []string{identifierOf("web-aaa"), identifierOf("stuck-aaa")}, identifiersOf(pods))
 		assert.True(t, tracked[identifierOf("stuck-aaa")],
@@ -268,7 +268,7 @@ func TestTrackFailedCleanups(t *testing.T) {
 
 	t.Run("the caller's identifier map is not mutated", func(t *testing.T) {
 		ids := map[string]bool{identifierOf("web-aaa"): true}
-		_, _ = trackFailedCleanups(targets, failed, ids)
+		_, _ = trackFailedCleanups(targets, failed, ids, nameIdentity)
 
 		assert.Len(t, ids, 1, "the caller's identifier map must not gain the failed identifiers")
 	})
@@ -281,14 +281,14 @@ func TestTrackFailedCleanups(t *testing.T) {
 		withSpare[0], withSpare[1] = pod("web-aaa"), pod("sentinel-aaa")
 		caller := withSpare[:1]
 
-		_, _ = trackFailedCleanups(caller, failed, nil)
+		_, _ = trackFailedCleanups(caller, failed, nil, nameIdentity)
 
 		assert.Equal(t, "sentinel-aaa", withSpare[1].Name,
 			"the helper must clone before appending, or it overwrites what the caller still holds past len")
 	})
 
 	t.Run("a nil identifier map is usable", func(t *testing.T) {
-		_, tracked := trackFailedCleanups(nil, failed, nil)
+		_, tracked := trackFailedCleanups(nil, failed, nil, nameIdentity)
 		assert.True(t, tracked[identifierOf("stuck-aaa")])
 	})
 }
@@ -306,7 +306,7 @@ func TestAttachProbesForIdentifier(t *testing.T) {
 
 	t.Run("attaches every pod of the identifier and skips the rest", func(t *testing.T) {
 		bpf := &ebpf.MockBpfClient{}
-		require.NoError(t, attachProbesForIdentifier(bpf, podIdentifier, pods))
+		require.NoError(t, attachProbesForIdentifier(bpf, podIdentifier, pods, nameIdentity))
 
 		assert.True(t, bpf.AttachedPods[nsName("web-aaa")])
 		assert.True(t, bpf.AttachedPods[nsName("web-bbb")])
@@ -320,7 +320,7 @@ func TestAttachProbesForIdentifier(t *testing.T) {
 			AttacheBPFProbesErrFor: map[types.NamespacedName]error{nsName("web-aaa"): attachFailed},
 		}
 
-		err := attachProbesForIdentifier(bpf, podIdentifier, pods)
+		err := attachProbesForIdentifier(bpf, podIdentifier, pods, nameIdentity)
 		require.ErrorIs(t, err, attachFailed)
 		assert.True(t, bpf.AttachedPods[nsName("web-bbb")],
 			"the co-located replica shares the maps and must still be attached")

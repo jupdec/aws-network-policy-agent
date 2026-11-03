@@ -165,7 +165,7 @@ func BenchmarkPEReconcileReads(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					_, podIdentifiers, _, _, _, err := r.deriveTargetPodsForParentNP(ctx, "np", "ns", "np-0")
+					_, podIdentifiers, _, _, _, _, err := r.deriveTargetPodsForParentNP(ctx, "np", "ns", "np-0")
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -215,7 +215,7 @@ func TestDeriveFirewallRules_DoesNotWriteIntoCachedSlices(t *testing.T) {
 			r := NewPolicyEndpointsReconciler(reader, benchNodeIP, nil, false)
 			ctx := context.Background()
 
-			_, podIdentifiers, _, _, _, err := r.deriveTargetPodsForParentNP(ctx, "np", "ns", pe.Name)
+			_, podIdentifiers, _, _, _, _, err := r.deriveTargetPodsForParentNP(ctx, "np", "ns", pe.Name)
 			assert.NoError(t, err)
 			assert.Len(t, podIdentifiers, 1)
 			for podIdentifier := range podIdentifiers {
@@ -286,7 +286,7 @@ func TestFirewallRuleDerivation_LeavesCachedObjectsUnchanged(t *testing.T) {
 
 		r := NewPolicyEndpointsReconciler(&cacheReader{pes: pes}, benchNodeIP, nil, false)
 		ctx := context.Background()
-		_, podIdentifiers, _, _, _, err := r.deriveTargetPodsForParentNP(ctx, "np", "ns", "np-aaaa")
+		_, podIdentifiers, _, _, _, _, err := r.deriveTargetPodsForParentNP(ctx, "np", "ns", "np-aaaa")
 		assert.NoError(t, err)
 		assert.Len(t, podIdentifiers, 1)
 		processor := fwrp.NewFirewallRuleProcessor(benchNodeIP, "/32", false)
@@ -343,7 +343,7 @@ func TestFirewallRuleDerivation_LeavesCachedObjectsUnchanged(t *testing.T) {
 
 		r := NewClusterPolicyEndpointsReconciler(&cacheReader{cpes: cpes}, benchNodeIP, nil)
 		ctx := context.Background()
-		_, podIdentifiers, _, _, _, err := r.deriveTargetPodsForParentCNP(ctx, "cnp", "cnp-aaaa")
+		_, podIdentifiers, _, _, _, _, err := r.deriveTargetPodsForParentCNP(ctx, "cnp", "cnp-aaaa")
 		assert.NoError(t, err)
 		assert.Len(t, podIdentifiers, 1)
 		processor := fwrp.NewFirewallRuleProcessor(benchNodeIP, "/32", false)

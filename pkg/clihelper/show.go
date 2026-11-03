@@ -3,6 +3,7 @@ package clihelper
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unsafe"
@@ -14,6 +15,7 @@ import (
 	goebpfmaps "github.com/aws/aws-ebpf-sdk-go/pkg/maps"
 	goebpfpgms "github.com/aws/aws-ebpf-sdk-go/pkg/progs"
 	goebpfutils "github.com/aws/aws-ebpf-sdk-go/pkg/utils"
+	"github.com/aws/aws-network-policy-agent/pkg/podidentity"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 )
 
@@ -44,11 +46,18 @@ func Show() error {
 		return err
 	}
 
+	// Identities are label hashes; the agent publishes what each one stands for.
+	identities, err := podidentity.ReadSnapshot(podidentity.SnapshotPath)
+	if err != nil {
+		identities = nil
+	}
+
 	for pinPath, bpfEntry := range bpfState {
 		podIdentifier, direction := utils.GetPodIdentifierFromBPFPinPath(pinPath)
 		fmt.Println("PinPath: ", pinPath)
 		line := fmt.Sprintf("Pod Identifier : %s  Direction : %s \n", podIdentifier, direction)
 		fmt.Print(line)
+		fmt.Print(describeIdentity(identities, podIdentifier))
 		bpfProg := bpfEntry.Program
 		fmt.Println("Prog ID: ", bpfProg.ProgID)
 		fmt.Println("Associated Maps -> ")
@@ -439,4 +448,30 @@ func MapWalkv6(mapID int) error {
 	}
 
 	return nil
+}
+
+// describeIdentity renders the labels and pods an identity stands for, from the agent's
+// snapshot. Empty if the snapshot is unavailable.
+func describeIdentity(identities map[string]podidentity.IdentityInfo, podIdentifier string) string {
+	if identities == nil {
+		return ""
+	}
+	info, ok := identities[podIdentifier]
+	if !ok {
+		return "Labels : (no local pod uses this identity)\n"
+	}
+	labels := "(unavailable: isolated identity)"
+	if info.Labels != nil {
+		keys := make([]string, 0, len(info.Labels))
+		for k := range info.Labels {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		pairs := make([]string, 0, len(keys))
+		for _, k := range keys {
+			pairs = append(pairs, k+"="+info.Labels[k])
+		}
+		labels = "{" + strings.Join(pairs, ", ") + "}"
+	}
+	return fmt.Sprintf("Labels : %s\nPods : %s\n", labels, strings.Join(info.Pods, ", "))
 }

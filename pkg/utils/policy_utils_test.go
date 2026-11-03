@@ -140,7 +140,14 @@ func TestGetPodListToBeCleanedUp(t *testing.T) {
 			PodIP:          v1alpha1.NetworkAddress(ip),
 		}
 	}
-	idOf := func(name string) string { return GetPodIdentifier(name, "ns") }
+	// web-aaa and web-bbb have identical labels; gone has no known identity.
+	webIdentity := PodIdentity(map[string]string{"app": "web"}, "ns")
+	identities := map[string]string{"web-aaa": webIdentity, "web-bbb": webIdentity,
+		"api-aaa": PodIdentity(map[string]string{"app": "api"}, "ns")}
+	identityOf := func(pod types.NamespacedName) (string, bool) {
+		id, ok := identities[pod.Name]
+		return id, ok
+	}
 
 	tests := []struct {
 		name       string
@@ -165,8 +172,22 @@ func TestGetPodListToBeCleanedUp(t *testing.T) {
 			name:       "a pod whose identifier is still selected is left alone",
 			oldPodSet:  []npatypes.Pod{pod("web-aaa", "10.1.1.1")},
 			newPodSet:  []npatypes.Pod{pod("web-bbb", "10.1.1.2")},
-			identifier: map[string]bool{idOf("web-aaa"): true},
+			identifier: map[string]bool{webIdentity: true},
 			want:       nil,
+		},
+		{
+			name:       "a pod whose identity is unknown is cleaned up",
+			oldPodSet:  []npatypes.Pod{pod("gone", "10.1.1.3")},
+			newPodSet:  []npatypes.Pod{pod("web-bbb", "10.1.1.2")},
+			identifier: map[string]bool{webIdentity: true},
+			want:       []string{"gone"},
+		},
+		{
+			name:       "a colliding name does not shield a pod with other labels",
+			oldPodSet:  []npatypes.Pod{pod("api-aaa", "10.1.1.4")},
+			newPodSet:  []npatypes.Pod{pod("web-bbb", "10.1.1.2")},
+			identifier: map[string]bool{webIdentity: true},
+			want:       []string{"api-aaa"},
 		},
 		{
 			name:      "an unchanged pod is left alone",
@@ -178,7 +199,7 @@ func TestGetPodListToBeCleanedUp(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := GetPodListToBeCleanedUp(tt.oldPodSet, tt.newPodSet, tt.identifier)
+			got := GetPodListToBeCleanedUp(tt.oldPodSet, tt.newPodSet, tt.identifier, identityOf)
 			names := make([]string, 0, len(got))
 			for _, p := range got {
 				names = append(names, p.Name)

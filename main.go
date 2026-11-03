@@ -26,6 +26,7 @@ import (
 
 	cnirpc "github.com/aws/amazon-vpc-cni-k8s/rpc"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
+	"github.com/aws/aws-network-policy-agent/pkg/podidentity"
 	"github.com/aws/aws-network-policy-agent/pkg/rpc"
 	"github.com/aws/aws-network-policy-agent/pkg/rpcclient"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
@@ -50,8 +51,11 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	//+kubebuilder:scaffold:imports
 )
+
+const nodeNameEnv = "MY_NODE_NAME"
 
 var (
 	scheme              = runtime.NewScheme()
@@ -89,7 +93,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	runtimeOpts := config.BuildRuntimeOptions(ctrlConfig.RuntimeConfig, scheme)
+	// Pods are enforced under an identity derived from their labels, which the agent reads
+	// for this node's pods only. MY_NODE_NAME is set from spec.nodeName in the daemonset.
+	nodeName := os.Getenv(nodeNameEnv)
+	if nodeName == "" {
+		log.Warnf("%s is not set: pod labels are read with a live GET per pod, and relabels are not followed", nodeNameEnv)
+	}
+	runtimeOpts := config.BuildRuntimeOptions(ctrlConfig.RuntimeConfig, scheme, nodeName)
 	mgr, err := ctrl.NewManager(restCFG, runtimeOpts)
 	if err != nil {
 		log.Errorf("unable to create controller manager %v", err)
@@ -123,13 +133,52 @@ func main() {
 		ebpfClient.ReAttachEbpfProbes()
 
 		policyEndpointController = controllers.NewPolicyEndpointsReconciler(mgr.GetClient(), nodeIP, ebpfClient, ctrlConfig.EnableIPv6)
+		clusterPolicyEndpointController = controllers.NewClusterPolicyEndpointsReconciler(mgr.GetClient(), nodeIP, ebpfClient)
+
+		// The manager's client reads pods from the node-scoped informer. The API reader
+		// serves reads before the cache syncs, and misses.
+		var podCache client.Reader
+		if nodeName != "" {
+			podCache = mgr.GetClient()
+		}
+		identityResolver := podidentity.NewAPIResolver(podCache, mgr.GetAPIReader())
+		policyEndpointController.SetIdentityResolver(identityResolver)
+		clusterPolicyEndpointController.SetIdentityResolver(identityResolver)
+		identitySnapshot := podidentity.NewSnapshot(podidentity.SnapshotPath)
+		policyEndpointController.SetIdentitySnapshot(identitySnapshot)
+		if err := mgr.Add(identitySnapshot); err != nil {
+			log.Errorf("unable to add pod identity snapshot writer %v", err)
+			os.Exit(1)
+		}
+
+		if nodeName != "" {
+			// Move every local pod onto its label identity before the reconcilers run: after
+			// an upgrade from name-prefix identities, or a restart, pods are still filtered by
+			// programs that survived in bpffs. Then follow relabels.
+			startupGate := make(chan struct{})
+			policyEndpointController.SetStartupGate(startupGate)
+			clusterPolicyEndpointController.SetStartupGate(startupGate)
+			enforcer := controllers.PodEnforcer{Policy: policyEndpointController, ClusterPolicy: clusterPolicyEndpointController}
+			if err := mgr.Add(&controllers.IdentitySweep{
+				Pods:             mgr.GetClient(),
+				WaitForCacheSync: mgr.GetCache().WaitForCacheSync,
+				Resolver:         identityResolver,
+				Enforcer:         enforcer,
+				Gate:             startupGate,
+			}); err != nil {
+				log.Errorf("unable to add pod identity sweep %v", err)
+				os.Exit(1)
+			}
+			if err := controllers.NewPodIdentityReconciler(mgr.GetClient(), enforcer, startupGate).SetupWithManager(mgr); err != nil {
+				log.Errorf("unable to create controller PodIdentity %v", err)
+				os.Exit(1)
+			}
+		}
 
 		if err = policyEndpointController.SetupWithManager(ctx, mgr); err != nil {
 			log.Errorf("unable to create controller PolicyEndpoints %v", err)
 			os.Exit(1)
 		}
-
-		clusterPolicyEndpointController = controllers.NewClusterPolicyEndpointsReconciler(mgr.GetClient(), nodeIP, ebpfClient)
 		if err = clusterPolicyEndpointController.SetupWithManager(ctx, mgr); err != nil {
 			log.Errorf("unable to create controller ClusterPolicyEndpoints %v", err)
 			os.Exit(1)

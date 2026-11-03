@@ -161,7 +161,7 @@ func TestClusterPolicySlices_PriorPodsDedupedByIdentity(t *testing.T) {
 			[]npatypes.Pod{{NamespacedName: web0, PodIP: policyk8sawsv1.NetworkAddress(ip)}})
 	}
 
-	_, _, podsToBeCleanedUp, _, _, err := fx.r.deriveTargetPodsForParentCNP(
+	_, _, podsToBeCleanedUp, _, _, _, err := fx.r.deriveTargetPodsForParentCNP(
 		context.TODO(), "cnp-1", "cnp-1-aaaaa")
 	require.NoError(t, err)
 

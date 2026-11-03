@@ -154,6 +154,22 @@ type BpfClient interface {
 	GetNetworkPolicyMode() string
 	CreatePodStateEbpfEntryIfNotExists(podIdentifier string, key int, state int) error
 	HasBPFContext(podIdentifier string) bool
+	// AttachedPodIdentifier returns the identifier whose programs the pod's TC filters
+	// point at on this node. It is the record of what a pod is enforced under: unlike a
+	// label lookup it survives the pod object being deleted, so CNI DEL and cleanup use it.
+	AttachedPodIdentifier(pod types.NamespacedName) (string, bool)
+	// LoadBPFPrograms loads podIdentifier's ingress and egress programs and maps without
+	// attaching them to any pod, so the caller can program the maps before a pod's traffic
+	// reaches them. It reports whether anything was loaded, i.e. whether the maps are new.
+	LoadBPFPrograms(podIdentifier string) (bool, error)
+	// RepointBPFProbes moves an attached pod onto podIdentifier's programs, which must be
+	// loaded. The pod's TC filters are replaced in place, so it is never unfiltered. The old
+	// identifier's programs and maps are deleted once no pod uses them. A pod that is not
+	// attached yet is attached.
+	RepointBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int) error
+	// ReleaseUnusedPodIdentifiers deletes the programs and maps of every identifier not in
+	// keep that no attached pod uses, and returns the identifiers it deleted.
+	ReleaseUnusedPodIdentifiers(keep map[string]bool) []string
 }
 
 type BPFContext struct {
@@ -425,6 +441,12 @@ type bpfClient struct {
 	clusterPolicyEgressInMemoryMap *sync.Map
 	// This is in-memory map to track recently deleted pods (key: podNamespacedName, value: time added to map)
 	deletedPods *sync.Map
+	// podToIdentifier maps a pod (podNamespacedName) to the identifier its TC filters point
+	// at. Written under that identifier's lock.
+	podToIdentifier sync.Map
+	// tcReplacer swaps a pod's TC filter to another program in one netlink call. Nil means
+	// netlinkFilterReplacer.
+	tcReplacer tcFilterReplacer
 }
 
 func checkAndUpdateBPFBinaries(bpfTCClient tc.BpfTc, bpfBinaries []string, hostBinaryPath string) (bool, bool, bool, error) {
@@ -873,35 +895,56 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 		currentPodSet, _ := l.egressProgToPodsMap.LoadOrStore(egressProgFD, make(map[string]struct{}))
 		currentPodSet.(map[string]struct{})[podNamespacedName] = struct{}{}
 	}
+	l.podToIdentifier.Store(podNamespacedName, podIdentifier)
 	return firstPodInPodIdentifier, nil
 }
 
-func (l *bpfClient) attachIngressBPFProbe(hostVethName string, podIdentifier string) (int, error) {
-	// We will re-use the same eBPF program instance for pods belonging to same replicaset
-	// Check if we've already loaded an ELF file for this PolicyEndpoint resource and re-use
-	// if present, otherwise load a new instance and attach it
-
-	var progFD int
-	var err error
-	var ingressProgInfo map[string]goelf.BpfData
+// ingressProgram returns podIdentifier's ingress program, loading it if needed. Pods with
+// the same identifier share one program instance and its maps. Callers must hold the
+// identifier lock, except during startup re-attach.
+func (l *bpfClient) ingressProgram(podIdentifier string) (int, error) {
 	var peBPFContext BPFContext
-	value, ok := l.policyEndpointeBPFContext.Load(podIdentifier)
-	if ok {
+	if value, ok := l.policyEndpointeBPFContext.Load(podIdentifier); ok {
 		peBPFContext = value.(BPFContext)
 	}
-
 	if peBPFContext.ingressPgmInfo.Program.ProgFD != 0 {
 		log().Info("Found an existing instance, let's derive the ingress context..")
-		ingressEbpfProgEntry := peBPFContext.ingressPgmInfo
-		progFD = ingressEbpfProgEntry.Program.ProgFD
-	} else {
-		ingressProgInfo, progFD, err = l.loadBPFProgram(l.ingressBinary, "ingress", podIdentifier)
-		if err != nil {
-			return 0, err
-		}
-		pinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, "ingress")
-		peBPFContext.ingressPgmInfo = ingressProgInfo[pinPath]
-		l.policyEndpointeBPFContext.Store(podIdentifier, peBPFContext)
+		return peBPFContext.ingressPgmInfo.Program.ProgFD, nil
+	}
+	ingressProgInfo, progFD, err := l.loadBPFProgram(l.ingressBinary, "ingress", podIdentifier)
+	if err != nil {
+		return 0, err
+	}
+	pinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, "ingress")
+	peBPFContext.ingressPgmInfo = ingressProgInfo[pinPath]
+	l.policyEndpointeBPFContext.Store(podIdentifier, peBPFContext)
+	return progFD, nil
+}
+
+// egressProgram is ingressProgram for the egress direction.
+func (l *bpfClient) egressProgram(podIdentifier string) (int, error) {
+	var peBPFContext BPFContext
+	if value, ok := l.policyEndpointeBPFContext.Load(podIdentifier); ok {
+		peBPFContext = value.(BPFContext)
+	}
+	if peBPFContext.egressPgmInfo.Program.ProgFD != 0 {
+		log().Info("Found an existing instance, let's derive the egress context..")
+		return peBPFContext.egressPgmInfo.Program.ProgFD, nil
+	}
+	egressProgInfo, progFD, err := l.loadBPFProgram(l.egressBinary, "egress", podIdentifier)
+	if err != nil {
+		return 0, err
+	}
+	pinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, "egress")
+	peBPFContext.egressPgmInfo = egressProgInfo[pinPath]
+	l.policyEndpointeBPFContext.Store(podIdentifier, peBPFContext)
+	return progFD, nil
+}
+
+func (l *bpfClient) attachIngressBPFProbe(hostVethName string, podIdentifier string) (int, error) {
+	progFD, err := l.ingressProgram(podIdentifier)
+	if err != nil {
+		return 0, err
 	}
 
 	log().Infof("Attempting to do an Ingress Attach with progFD: %d", progFD)
@@ -922,31 +965,9 @@ func (l *bpfClient) attachIngressBPFProbe(hostVethName string, podIdentifier str
 }
 
 func (l *bpfClient) attachEgressBPFProbe(hostVethName string, podIdentifier string) (int, error) {
-	// We will re-use the same eBPF program instance for pods belonging to same replicaset
-	// Check if we've already loaded an ELF file for this PolicyEndpoint resource and re-use
-	// if present, otherwise load a new instance and attach it
-
-	var progFD int
-	var err error
-	var egressProgInfo map[string]goelf.BpfData
-	var peBPFContext BPFContext
-	value, ok := l.policyEndpointeBPFContext.Load(podIdentifier)
-	if ok {
-		peBPFContext = value.(BPFContext)
-	}
-
-	if peBPFContext.egressPgmInfo.Program.ProgFD != 0 {
-		log().Info("Found an existing instance, let's derive the egress context..")
-		egressEbpfProgEntry := peBPFContext.egressPgmInfo
-		progFD = egressEbpfProgEntry.Program.ProgFD
-	} else {
-		egressProgInfo, progFD, err = l.loadBPFProgram(l.egressBinary, "egress", podIdentifier)
-		if err != nil {
-			return 0, err
-		}
-		pinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, "egress")
-		peBPFContext.egressPgmInfo = egressProgInfo[pinPath]
-		l.policyEndpointeBPFContext.Store(podIdentifier, peBPFContext)
+	progFD, err := l.egressProgram(podIdentifier)
+	if err != nil {
+		return 0, err
 	}
 
 	log().Infof("Attempting to do an Egress Attach with progFD: %d", progFD)
@@ -977,6 +998,11 @@ func (l *bpfClient) HasBPFContext(podIdentifier string) bool {
 }
 
 func (l *bpfClient) DeleteBPFProbes(pod types.NamespacedName, podIdentifier string) error {
+	// The identifier the pod is attached to is authoritative: the caller's may have been
+	// derived from labels that changed after the attach.
+	if attached, ok := l.AttachedPodIdentifier(pod); ok {
+		podIdentifier = attached
+	}
 	l.podIdentifierLocks.Lock(podIdentifier)
 	defer l.podIdentifierLocks.Unlock(podIdentifier)
 	log().Debugf("Got the podIdentifierLock for Pod: %s Namespace: %s PodIdentifier: %s", pod.Name, pod.Namespace, podIdentifier)
@@ -984,6 +1010,7 @@ func (l *bpfClient) DeleteBPFProbes(pod types.NamespacedName, podIdentifier stri
 	isProgFdShared, err := l.isProgFdShared(pod.Name, pod.Namespace)
 	l.deletePodFromIngressProgPodCaches(pod.Name, pod.Namespace)
 	l.deletePodFromEgressProgPodCaches(pod.Name, pod.Namespace)
+	l.podToIdentifier.Delete(utils.GetPodNamespacedName(pod.Name, pod.Namespace))
 	l.deletedPods.Store(utils.GetPodNamespacedName(pod.Name, pod.Namespace), time.Now())
 
 	if err == nil && !isProgFdShared {

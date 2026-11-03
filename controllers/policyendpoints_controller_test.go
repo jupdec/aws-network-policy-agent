@@ -276,24 +276,21 @@ func TestPolicyEndpointNonLocalPodIdentifierChurn(t *testing.T) {
 		assert.Nil(t, err)
 	}
 
-	// podIdentifierToPolicyEndpointMap must NOT accumulate one entry per churned
-	// Job. Only the live identifiers should remain: local + stable remote + the
-	// single most-recent churn pod.
-	assert.Equal(t, 3, sizeOfSyncMap(&r.podIdentifierToPolicyEndpointMap),
-		"podIdentifierToPolicyEndpointMap leaked churned non-local identifiers")
+	// Non-local pods are not tracked at all (#613): their labels are not cached on this
+	// node, and an entry for them could only be pruned by their own node. Only the local
+	// identifier remains, however many Jobs churned elsewhere.
+	assert.Equal(t, 1, sizeOfSyncMap(&r.podIdentifierToPolicyEndpointMap),
+		"podIdentifierToPolicyEndpointMap must hold node-local identifiers only")
 
-	// The live local and live non-local sibling identifiers must be retained.
 	_, ok := r.podIdentifierToPolicyEndpointMap.Load(localIdentifier)
 	assert.True(t, ok, "local identifier should be retained")
 	_, ok = r.podIdentifierToPolicyEndpointMap.Load(stableRemoteIdentifier)
-	assert.True(t, ok, "stable non-local sibling identifier should be retained (strict-mode fast path)")
+	assert.False(t, ok, "non-local pods are not bound")
 
-	// networkPolicyToPodIdentifierMap now tracks the cluster-wide set; it must be
-	// a single NP entry holding exactly the 3 live identifiers, not churn history.
 	val, ok := r.networkPolicyToPodIdentifierMap.Load(utils.GetNetworkPolicyIdentifier("allow-all-egress", "my-namespace"))
 	assert.True(t, ok)
-	assert.Equal(t, 3, len(val.([]string)),
-		"networkPolicyToPodIdentifierMap should track only currently-selected identifiers")
+	assert.Equal(t, []string{localIdentifier}, val.([]string),
+		"networkPolicyToPodIdentifierMap should track only the local selection")
 }
 
 func TestPolicyEndpointReconcile_StaleDeletedPodDoesNotBlockLiveProgramming(t *testing.T) {
@@ -600,7 +597,7 @@ func TestDeriveTargetPodsForParentNP_StaleIdentifierIsPurgedAndSelectedForCleanu
 	assert.True(t, tracked, "the initial reconcile must record the identifier in MAP3")
 
 	currentPE = getPolicyEndpoint(policyName, namespace, nil)
-	targetPods, podIdentifiers, podsToBeCleanedUp, parentPEList, clusterWidePodIdentifiers, err := r.deriveTargetPodsForParentNP(
+	targetPods, podIdentifiers, podsToBeCleanedUp, parentPEList, clusterWidePodIdentifiers, _, err := r.deriveTargetPodsForParentNP(
 		context.Background(), policyName, namespace, currentPE.Name)
 	assert.NoError(t, err)
 	assert.Empty(t, targetPods)
@@ -622,13 +619,13 @@ func TestSameNamedNetworkPoliciesInDifferentNamespacesRemainIndependent(t *testi
 	)
 
 	podA := policyendpoint.PodEndpoint{
-		HostIP:    "2.2.2.2",
+		HostIP:    nodeIP,
 		PodIP:     "10.2.1.1",
 		Name:      "workload-a-1",
 		Namespace: namespaceA,
 	}
 	podB := policyendpoint.PodEndpoint{
-		HostIP:    "3.3.3.3",
+		HostIP:    nodeIP,
 		PodIP:     "10.3.1.1",
 		Name:      "workload-b-1",
 		Namespace: namespaceB,

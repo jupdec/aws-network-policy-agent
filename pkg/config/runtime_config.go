@@ -3,11 +3,13 @@ package config
 import (
 	"time"
 
+	"github.com/aws/aws-network-policy-agent/pkg/podidentity"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/spf13/pflag"
@@ -62,11 +64,19 @@ func BuildRestConfig(rtCfg RuntimeConfig) (*rest.Config, error) {
 	return restCFG, nil
 }
 
-// BuildRuntimeOptions builds the options for the controller runtime based on config
-func BuildRuntimeOptions(rtCfg RuntimeConfig, scheme *runtime.Scheme) ctrl.Options {
-	return ctrl.Options{
+// BuildRuntimeOptions builds the options for the controller runtime based on config.
+//
+// nodeName scopes the manager's Pod informer to this node's pods, which is all the agent
+// reads labels for. With an empty nodeName no Pod cache is configured, and callers must not
+// read Pods through the manager's client: the first read would start a cluster-wide watch.
+func BuildRuntimeOptions(rtCfg RuntimeConfig, scheme *runtime.Scheme, nodeName string) ctrl.Options {
+	opts := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: rtCfg.MetricsBindAddress},
 		HealthProbeBindAddress: rtCfg.HealthProbeBindAddress,
 	}
+	if nodeName != "" {
+		opts.Cache = cache.Options{ByObject: podidentity.PodCacheByObject(nodeName)}
+	}
+	return opts
 }

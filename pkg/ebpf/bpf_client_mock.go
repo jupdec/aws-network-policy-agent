@@ -84,6 +84,18 @@ type MockBpfClient struct {
 	// the first failure.
 	AttachedPods map[types.NamespacedName]bool
 
+	// The identifier each attached pod's filters point at, as AttachedPodIdentifier reports
+	// it. Survives Reset because it models node state rather than recorded calls.
+	AttachedIdentifiers map[types.NamespacedName]string
+	// Identifiers loaded through LoadBPFPrograms, in call order.
+	LoadedIdentifiers []string
+	// Pods moved through RepointBPFProbes, in call order.
+	Repoints []Repoint
+	// Per-pod failures for RepointBPFProbes.
+	RepointBPFProbesErrFor map[types.NamespacedName]error
+	// The keep set passed to each ReleaseUnusedPodIdentifiers call.
+	ReleaseKeepSets []map[string]bool
+
 	// Per-identifier call records. The Last* fields above retain only the most recent
 	// call, which cannot distinguish outcomes when one reconcile programs several
 	// identifiers.
@@ -97,6 +109,13 @@ type MockBpfClient struct {
 	// contents rather than recorded calls. CreatePodStateEbpfEntryIfNotExists uses
 	// BPF_NOEXIST, so it must not overwrite one.
 	podStateSeeded map[PodStateKey]bool
+}
+
+// Repoint records one RepointBPFProbes call.
+type Repoint struct {
+	Pod  types.NamespacedName
+	From string
+	To   string
 }
 
 // PodStateKey identifies one entry of the pod-state map. POD_STATE_MAP_KEY holds the
@@ -154,11 +173,57 @@ func (m *MockBpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier
 		m.AttachedPods = map[types.NamespacedName]bool{}
 	}
 	m.AttachedPods[pod] = true
+	// As in production, an attached pod stays on its identifier until it is moved.
+	if _, attached := m.AttachedIdentifiers[pod]; !attached {
+		if m.AttachedIdentifiers == nil {
+			m.AttachedIdentifiers = map[types.NamespacedName]string{}
+		}
+		m.AttachedIdentifiers[pod] = podIdentifier
+	}
 	return m.AttachFirstPodInPodIdentifier, nil
 }
 
 func (m *MockBpfClient) DeleteBPFProbes(pod types.NamespacedName, podIdentifier string) error {
 	m.CallLog = append(m.CallLog, "DeleteBPFProbes")
+	delete(m.AttachedIdentifiers, pod)
+	return nil
+}
+
+func (m *MockBpfClient) AttachedPodIdentifier(pod types.NamespacedName) (string, bool) {
+	podIdentifier, ok := m.AttachedIdentifiers[pod]
+	return podIdentifier, ok
+}
+
+func (m *MockBpfClient) LoadBPFPrograms(podIdentifier string) (bool, error) {
+	m.CallLog = append(m.CallLog, "LoadBPFPrograms")
+	m.LoadedIdentifiers = append(m.LoadedIdentifiers, podIdentifier)
+	if m.PodIdentifiersWithoutBPFContext[podIdentifier] {
+		m.ForgetIdentifier(podIdentifier)
+	}
+	return m.AttachFirstPodInPodIdentifier, nil
+}
+
+func (m *MockBpfClient) RepointBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int) error {
+	m.CallLog = append(m.CallLog, "RepointBPFProbes")
+	if err := m.RepointBPFProbesErrFor[pod]; err != nil {
+		return err
+	}
+	from, attached := m.AttachedIdentifiers[pod]
+	if !attached {
+		_, err := m.AttacheBPFProbes(pod, podIdentifier, numInterfaces, false)
+		return err
+	}
+	if from == podIdentifier {
+		return nil
+	}
+	m.Repoints = append(m.Repoints, Repoint{Pod: pod, From: from, To: podIdentifier})
+	m.AttachedIdentifiers[pod] = podIdentifier
+	return nil
+}
+
+func (m *MockBpfClient) ReleaseUnusedPodIdentifiers(keep map[string]bool) []string {
+	m.CallLog = append(m.CallLog, "ReleaseUnusedPodIdentifiers")
+	m.ReleaseKeepSets = append(m.ReleaseKeepSets, keep)
 	return nil
 }
 

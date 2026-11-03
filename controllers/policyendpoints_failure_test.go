@@ -340,7 +340,7 @@ func TestPolicySlices_PriorPodsDedupedByIdentity(t *testing.T) {
 			[]npatypes.Pod{{NamespacedName: web0, PodIP: policyk8sawsv1.NetworkAddress(ip)}})
 	}
 
-	_, _, podsToBeCleanedUp, _, _, err := fx.r.deriveTargetPodsForParentNP(
+	_, _, podsToBeCleanedUp, _, _, _, err := fx.r.deriveTargetPodsForParentNP(
 		context.TODO(), "np-1", fixtureNamespace, "np-1-aaaaa")
 	require.NoError(t, err)
 

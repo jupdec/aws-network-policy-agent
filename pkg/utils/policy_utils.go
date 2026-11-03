@@ -5,9 +5,13 @@ import (
 	"sync"
 
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // GetPodListToBeCleanedUp compares old and new pod sets to determine which pods need cleanup.
+//
+// identityOf gives the identity an old pod is enforced under. A pod whose identity is
+// unknown is returned for cleanup; the cleanup then finds nothing attached and skips it.
 //
 // A pod is matched on NamespacedName, not on the whole struct: identity is the name, and
 // npatypes.Pod also carries PodIP, which the same pod can legitimately change (a StatefulSet
@@ -16,16 +20,17 @@ import (
 // when it still is. The podIdentifiers guard below happens to mask that today -- a pod in the
 // new set always has its identifier there too -- so this is a clarification rather than a
 // behaviour change, and it keeps the comparison from depending on that coincidence.
-func GetPodListToBeCleanedUp(oldPodSet []npatypes.Pod, newPodSet []npatypes.Pod, podIdentifiers map[string]bool) []npatypes.Pod {
+func GetPodListToBeCleanedUp(oldPodSet []npatypes.Pod, newPodSet []npatypes.Pod, podIdentifiers map[string]bool,
+	identityOf func(types.NamespacedName) (string, bool)) []npatypes.Pod {
 	var podsToBeCleanedUp []npatypes.Pod
 
 	for _, oldPod := range oldPodSet {
-		oldPodIdentifier := GetPodIdentifier(oldPod.Name, oldPod.Namespace)
+		oldPodIdentifier, known := identityOf(oldPod.NamespacedName)
 
 		stillSelected := slices.ContainsFunc(newPodSet, func(newPod npatypes.Pod) bool {
 			return newPod.NamespacedName == oldPod.NamespacedName
 		})
-		if !stillSelected && !podIdentifiers[oldPodIdentifier] {
+		if !stillSelected && !(known && podIdentifiers[oldPodIdentifier]) {
 			podsToBeCleanedUp = append(podsToBeCleanedUp, oldPod)
 		}
 	}

@@ -68,3 +68,13 @@ func TestPodIdentity_Golden(t *testing.T) {
 		assert.Equal(t, tt.want, PodIdentity(tt.labels, "prod"))
 	}
 }
+
+func TestIsolatedPodIdentity_NeverMatchesALabelIdentity(t *testing.T) {
+	isolated := IsolatedPodIdentity("db-evil", "prod")
+	assert.NotEqual(t, isolated, PodIdentity(map[string]string{}, "prod"))
+	assert.NotEqual(t, isolated, PodIdentity(map[string]string{"app": "db"}, "prod"))
+	assert.NotEqual(t, isolated, IsolatedPodIdentity("db-0", "prod"), "isolated identities are per pod")
+	assert.Equal(t, isolated, IsolatedPodIdentity("db-evil", "prod"), "stable across calls")
+	assert.True(t, strings.HasSuffix(isolated, "@prod"))
+	assert.NotContains(t, isolated, "_")
+}

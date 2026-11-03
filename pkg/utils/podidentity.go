@@ -10,6 +10,10 @@ import (
 // recipe produces different identities instead of silently matching old ones.
 const podIdentityVersion = "v1\n"
 
+// isolatedIdentityVersion prefixes the input of IsolatedPodIdentity. It differs from
+// podIdentityVersion, so an isolated identity can never equal a label identity.
+const isolatedIdentityVersion = "isolated-v1\n"
+
 // PodIdentity returns the enforcement identity for a pod: a 128-bit fingerprint of
 // the pod's labels, scoped to its namespace.
 //
@@ -43,5 +47,19 @@ func PodIdentity(labels map[string]string, namespace string) string {
 		h.Write([]byte(labels[k]))
 		h.Write([]byte{'\n'})
 	}
+	return hex.EncodeToString(h.Sum(nil)[:16]) + "@" + namespace
+}
+
+// IsolatedPodIdentity returns a per-pod identity for a pod whose labels could not be read
+// from the API server. No other pod can share it, so the pod gets its own program and map
+// set in the mode default (allow, or deny in strict mode) and inherits nobody's rules. Once
+// its labels are known, the pod is moved to its PodIdentity.
+//
+// It is derived from the pod name only to keep it stable across calls; it is never shared,
+// so the name grants nothing.
+func IsolatedPodIdentity(podName, namespace string) string {
+	h := sha256.New()
+	h.Write([]byte(isolatedIdentityVersion))
+	h.Write([]byte(podName))
 	return hex.EncodeToString(h.Sum(nil)[:16]) + "@" + namespace
 }

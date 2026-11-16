@@ -2812,3 +2812,151 @@ func TestBinaryChanged(t *testing.T) {
 	require.NoError(t, os.Remove(hostDir+TC_SHARED_BINARY))
 	assert.False(t, binaryChanged(binary, hostDir), "both copies missing")
 }
+
+func TestPinnedGlobalMapSchemaMismatched(t *testing.T) {
+	wantKeySize := uint32(24)  // sizeof(ConntrackKey)
+	wantValSize := uint32(16)  // sizeof(ConntrackVal)
+
+	tests := []struct {
+		name         string
+		infoByPath   map[string]goebpfmaps.BpfMapInfo
+		infoErr      map[string]error
+		wantMismatch bool
+	}{
+		{
+			name: "absent pin — no mismatch",
+			infoErr: map[string]error{CONNTRACK_MAP_PIN_PATH: errors.New("no pin")},
+		},
+		{
+			name: "matching schema — no mismatch",
+			infoByPath: map[string]goebpfmaps.BpfMapInfo{
+				CONNTRACK_MAP_PIN_PATH: {KeySize: wantKeySize, ValueSize: wantValSize},
+			},
+		},
+		{
+			name: "wrong key size",
+			infoByPath: map[string]goebpfmaps.BpfMapInfo{
+				CONNTRACK_MAP_PIN_PATH: {KeySize: wantKeySize + 4, ValueSize: wantValSize},
+			},
+			wantMismatch: true,
+		},
+		{
+			name: "wrong value size",
+			infoByPath: map[string]goebpfmaps.BpfMapInfo{
+				CONNTRACK_MAP_PIN_PATH: {KeySize: wantKeySize, ValueSize: wantValSize + 8},
+			},
+			wantMismatch: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := getMapInfoFromPinPath
+			t.Cleanup(func() { getMapInfoFromPinPath = orig })
+			getMapInfoFromPinPath = func(pinPath string) (goebpfmaps.BpfMapInfo, error) {
+				if tt.infoErr != nil {
+					if err, ok := tt.infoErr[pinPath]; ok {
+						return goebpfmaps.BpfMapInfo{}, err
+					}
+				}
+				if tt.infoByPath != nil {
+					if info, ok := tt.infoByPath[pinPath]; ok {
+						return info, nil
+					}
+				}
+				return goebpfmaps.BpfMapInfo{}, errors.New("unexpected pin path")
+			}
+			assert.Equal(t, tt.wantMismatch, pinnedGlobalMapSchemaMismatched())
+		})
+	}
+}
+
+func TestPinnedPodMapsSchemaMismatched(t *testing.T) {
+	wantTrieKeySize := uint32(8)   // sizeof(BPFTrieKey)
+	wantTrieValSize := uint32(288) // sizeof(BPFTrieVal) * 24
+	wantCPValSize := uint32(384)   // sizeof(BPFL4PriorityVal) * 24
+
+	type pinInfo struct {
+		suffix   string
+		keySize  uint32
+		valSize  uint32
+		readErr  bool
+	}
+
+	tests := []struct {
+		name         string
+		pins         []pinInfo
+		wantMismatch bool
+	}{
+		{
+			name: "empty directory — no mismatch",
+			pins: nil,
+		},
+		{
+			name: "unreadable pin — skipped, no mismatch",
+			pins: []pinInfo{{suffix: "_" + utils.TC_INGRESS_MAP, readErr: true}},
+		},
+		{
+			name: "all correct schemas",
+			pins: []pinInfo{
+				{suffix: "_" + utils.TC_INGRESS_MAP, keySize: wantTrieKeySize, valSize: wantTrieValSize},
+				{suffix: "_" + utils.TC_EGRESS_MAP, keySize: wantTrieKeySize, valSize: wantTrieValSize},
+				{suffix: "_" + utils.TC_CLUSTER_POLICY_INGRESS_MAP, keySize: wantTrieKeySize, valSize: wantCPValSize},
+				{suffix: "_" + utils.TC_CLUSTER_POLICY_EGRESS_MAP, keySize: wantTrieKeySize, valSize: wantCPValSize},
+				{suffix: "_" + utils.TC_INGRESS_POD_STATE_MAP, keySize: 4, valSize: 1},
+				{suffix: "_" + utils.TC_EGRESS_POD_STATE_MAP, keySize: 4, valSize: 1},
+			},
+		},
+		{
+			name: "wrong ingress_map value size",
+			pins: []pinInfo{
+				{suffix: "_" + utils.TC_INGRESS_MAP, keySize: wantTrieKeySize, valSize: wantTrieValSize + 12},
+			},
+			wantMismatch: true,
+		},
+		{
+			name: "wrong cp_egress_map value size",
+			pins: []pinInfo{
+				{suffix: "_" + utils.TC_CLUSTER_POLICY_EGRESS_MAP, keySize: wantTrieKeySize, valSize: wantCPValSize + 16},
+			},
+			wantMismatch: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build a fake temp directory with pin-named files.
+			dir := t.TempDir() + "/"
+			pinInfoByPath := map[string]goebpfmaps.BpfMapInfo{}
+			pinErrByPath := map[string]bool{}
+			for i, p := range tt.pins {
+				name := fmt.Sprintf("pod_%d%s", i, p.suffix)
+				path := dir + name
+				require.NoError(t, os.WriteFile(path, []byte{}, 0o600))
+				if p.readErr {
+					pinErrByPath[path] = true
+				} else {
+					pinInfoByPath[path] = goebpfmaps.BpfMapInfo{KeySize: p.keySize, ValueSize: p.valSize}
+				}
+			}
+
+			orig := getMapInfoFromPinPath
+			t.Cleanup(func() { getMapInfoFromPinPath = orig })
+			getMapInfoFromPinPath = func(pinPath string) (goebpfmaps.BpfMapInfo, error) {
+				if pinErrByPath[pinPath] {
+					return goebpfmaps.BpfMapInfo{}, errors.New("read error")
+				}
+				if info, ok := pinInfoByPath[pinPath]; ok {
+					return info, nil
+				}
+				return goebpfmaps.BpfMapInfo{}, errors.New("unexpected path: " + pinPath)
+			}
+
+			// Point the function at our temp directory by temporarily replacing
+			// the constant via a small wrapper. We can't swap the const, so we
+			// test by calling the helper with a closure-captured dir.
+			got := pinnedPodMapsSchemaMismatchedInDir(dir)
+			assert.Equal(t, tt.wantMismatch, got)
+		})
+	}
+}

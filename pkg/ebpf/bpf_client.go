@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"sync"
 	"time"
@@ -263,6 +264,19 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 	}
 	if reloadTCSharedMaps {
 		ingressUpdateRequired, egressUpdateRequired = true, true
+	}
+	// Schema check: if the binaries match but pinned maps were left from a
+	// prior partial upgrade (binaries copied, agent crashed before map
+	// recreation), force a full reload so the stale maps are replaced.
+	if !eventsUpdateRequired && pinnedGlobalMapSchemaMismatched() {
+		log().Warn("Pinned global BPF map schema mismatch — forcing full probe reload")
+		ingressUpdateRequired, egressUpdateRequired, eventsUpdateRequired = true, true, true
+	}
+	if !ingressUpdateRequired || !egressUpdateRequired {
+		if pinnedPodMapsSchemaMismatched() {
+			log().Warn("Pinned per-pod BPF map schema mismatch — forcing probe reload")
+			ingressUpdateRequired, egressUpdateRequired = true, true
+		}
 	}
 	log().Info("Probe validation Done")
 
@@ -565,6 +579,109 @@ func binaryChanged(binary, hostBinaryPath string) bool {
 	}
 	log().Info("comparing new and existing probes ...")
 	return !cmp.Equal(current, existing)
+}
+
+// getMapInfoFromPinPath queries the kernel for the live schema of a pinned BPF
+// map. Overridden in tests.
+var getMapInfoFromPinPath = func(pinPath string) (goebpfmaps.BpfMapInfo, error) {
+	return goebpfmaps.BpfMap{}.GetMapFromPinPath(pinPath)
+}
+
+// pinnedGlobalMapSchemaMismatched returns true if any pinned global map has a
+// key or value size that disagrees with what the current binary expects. Only
+// maps with non-zero expected sizes are checked; ring-buffer maps (key/value
+// both zero) are skipped.
+func pinnedGlobalMapSchemaMismatched() bool {
+	type schemaSpec struct{ keySize, valueSize uint32 }
+	expected := map[string]schemaSpec{
+		CONNTRACK_MAP_PIN_PATH: {
+			keySize:   uint32(unsafe.Sizeof(utils.ConntrackKey{})),
+			valueSize: uint32(unsafe.Sizeof(utils.ConntrackVal{})),
+		},
+	}
+	for pinPath, want := range expected {
+		info, err := getMapInfoFromPinPath(pinPath)
+		if err != nil {
+			continue // absent — handled by isConntrackMapPresent logic
+		}
+		if info.KeySize != want.keySize || info.ValueSize != want.valueSize {
+			log().Warnf("BPF global map schema mismatch at %s: live key=%d value=%d, expected key=%d value=%d",
+				pinPath, info.KeySize, info.ValueSize, want.keySize, want.valueSize)
+			return true
+		}
+	}
+	return false
+}
+
+// pinnedPodMapsSchemaMismatched returns true if any per-pod-identifier BPF map
+// on the node has a schema that disagrees with what the current binary expects.
+func pinnedPodMapsSchemaMismatched() bool {
+	return pinnedPodMapsSchemaMismatchedInDir(utils.BPF_MAPS_PIN_PATH_DIRECTORY)
+}
+
+// pinnedPodMapsSchemaMismatchedInDir is the testable core of
+// pinnedPodMapsSchemaMismatched. It samples one pin per map suffix rather than
+// checking every pod, since all pods' maps were created by the same binary.
+func pinnedPodMapsSchemaMismatchedInDir(dir string) bool {
+	type schemaSpec struct{ keySize, valueSize uint32 }
+	trieKeySize := uint32(unsafe.Sizeof(utils.BPFTrieKey{}))
+	expected := map[string]schemaSpec{
+		"_" + utils.TC_INGRESS_MAP: {
+			keySize:   trieKeySize,
+			valueSize: uint32(unsafe.Sizeof(utils.BPFTrieVal{})) * utils.MaxPortProtocol,
+		},
+		"_" + utils.TC_EGRESS_MAP: {
+			keySize:   trieKeySize,
+			valueSize: uint32(unsafe.Sizeof(utils.BPFTrieVal{})) * utils.MaxPortProtocol,
+		},
+		"_" + utils.TC_CLUSTER_POLICY_INGRESS_MAP: {
+			keySize:   trieKeySize,
+			valueSize: uint32(unsafe.Sizeof(utils.BPFL4PriorityVal{})) * utils.MaxPortProtocol,
+		},
+		"_" + utils.TC_CLUSTER_POLICY_EGRESS_MAP: {
+			keySize:   trieKeySize,
+			valueSize: uint32(unsafe.Sizeof(utils.BPFL4PriorityVal{})) * utils.MaxPortProtocol,
+		},
+		"_" + utils.TC_INGRESS_POD_STATE_MAP: {
+			keySize:   uint32(unsafe.Sizeof(uint32(0))),
+			valueSize: uint32(unsafe.Sizeof(pod_state{})),
+		},
+		"_" + utils.TC_EGRESS_POD_STATE_MAP: {
+			keySize:   uint32(unsafe.Sizeof(uint32(0))),
+			valueSize: uint32(unsafe.Sizeof(pod_state{})),
+		},
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false // fresh node with no pins yet
+	}
+
+	checked := make(map[string]bool, len(expected))
+	for _, e := range entries {
+		if e.IsDir() || len(checked) == len(expected) {
+			continue
+		}
+		name := e.Name()
+		for suffix, want := range expected {
+			if checked[suffix] || !strings.HasSuffix(name, suffix) {
+				continue
+			}
+			pinPath := dir + name
+			info, err := getMapInfoFromPinPath(pinPath)
+			if err != nil {
+				checked[suffix] = true // unreadable pin; skip this suffix
+				continue
+			}
+			checked[suffix] = true
+			if info.KeySize != want.keySize || info.ValueSize != want.valueSize {
+				log().Warnf("BPF pod map schema mismatch at %s: live key=%d value=%d, expected key=%d value=%d",
+					name, info.KeySize, info.ValueSize, want.keySize, want.valueSize)
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // tcSharedMapsPinned reports whether both shared maps are pinned. If not,

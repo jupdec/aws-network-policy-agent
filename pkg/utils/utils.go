@@ -41,6 +41,10 @@ var (
 	TC_INGRESS_POD_STATE_MAP        = "ingress_pod_state_map"
 	TC_EGRESS_POD_STATE_MAP         = "egress_pod_state_map"
 
+	// MaxPortProtocol is the number of port/protocol entries in each LPM trie
+	// map value slot. Must match MAX_PORT_PROTOCOL in the BPF C programs.
+	MaxPortProtocol = 24
+
 	CATCH_ALL_PROTOCOL   corev1.Protocol = "ANY_IP_PROTOCOL"
 	DENY_ALL_PROTOCOL    corev1.Protocol = "RESERVED_IP_PROTOCOL_NUMBER"
 	DEFAULT_CLUSTER_NAME                 = "k8s-cluster"

@@ -459,12 +459,18 @@ int handle_egress(struct __sk_buff *skb)
 		struct pod_state *clusterpolicy_pst = bpf_map_lookup_elem(&egress_pod_state_map, &CLUSTER_NETWORK_POLICY_KEY);
 		struct pod_state *pst = bpf_map_lookup_elem(&egress_pod_state_map, &NETWORK_POLICY_KEY);
 
-		// There should always be an entry in pod_state_map. pst returned in above line should never be null.
+		// pod_state_map entries are normally always present. A missing entry is
+		// a control-plane gap, not a policy verdict: fall back to DEFAULT_ALLOW
+		// and emit an ERROR_TIER event so the gap is observable.
 		if ((pst == NULL) || (clusterpolicy_pst == NULL)) {
-			evt.verdict = 0;
+			struct conntrack_value fallback_val = {};
+			fallback_val.val = CT_VAL_DEFAULT_ALLOW_DEFAULT_ALLOW;
+			fallback_val.last_seen = bpf_ktime_get_ns();
+			bpf_map_update_elem(&aws_conntrack_map, &flow_key, &fallback_val, 0);
+			evt.verdict = 1;
 			evt.tier = ERROR_TIER;
-			emit_deny_event(&evt);
-			return BPF_DROP;
+			bpf_ringbuf_output(&policy_events, &evt, sizeof(evt), 0);
+			return BPF_OK;
 		}
 
 		__u8 ct_pod_state_val = GET_CT_VAL(clusterpolicy_pst->state, pst->state);
@@ -520,5 +526,5 @@ int handle_egress(struct __sk_buff *skb)
 	return BPF_OK;
 }
 
-const volatile __u32 NPA_FILE_VERSION = 3;
+const volatile __u32 NPA_FILE_VERSION = 4;
 char _license[] SEC("license") = "GPL";

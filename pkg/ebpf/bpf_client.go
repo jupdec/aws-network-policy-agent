@@ -785,6 +785,8 @@ func (l *bpfClient) ReAttachEbpfProbes() error {
 	// Thus: Seed the cluster-policy pod-state key with DEFAULT_ALLOW.
 	cpState := DEFAULT_ALLOW
 
+	var errs []error
+
 	for interfaceName, pinPath := range l.interfaceNametoIngressPinPath {
 		podIdentifier, _ := utils.GetPodIdentifierFromBPFPinPath(pinPath)
 		log().Infof("ReattachEbpfProbes attaching ingress for %s interface %s", podIdentifier, interfaceName)
@@ -798,15 +800,14 @@ func (l *bpfClient) ReAttachEbpfProbes() error {
 			}
 		}
 		log().Infof("Updating ingress_pod_state map for podIdentifier: %s, networkPolicyMode: %s", podIdentifier, l.networkPolicyMode)
-		err = l.UpdatePodStateEbpfMaps(podIdentifier, POD_STATE_MAP_KEY, state, true, false)
-		if err != nil {
+		if err = l.UpdatePodStateEbpfMaps(podIdentifier, POD_STATE_MAP_KEY, state, true, false); err != nil {
 			log().Errorf("Map update(s) failed for podIdentifier %s error: %v", podIdentifier, err)
+			errs = append(errs, err)
 		}
-		err = l.UpdatePodStateEbpfMaps(podIdentifier, CLUSTER_POLICY_POD_STATE_MAP_KEY, cpState, true, false)
-		if err != nil {
+		if err = l.UpdatePodStateEbpfMaps(podIdentifier, CLUSTER_POLICY_POD_STATE_MAP_KEY, cpState, true, false); err != nil {
 			log().Errorf("Map update(s) failed for podIdentifier %s error: %v", podIdentifier, err)
+			errs = append(errs, err)
 		}
-
 	}
 
 	for interfaceName, pinPath := range l.interfaceNametoEgressPinPath {
@@ -821,19 +822,17 @@ func (l *bpfClient) ReAttachEbpfProbes() error {
 				continue
 			}
 		}
-
 		log().Infof("Updating egress_pod_state map for podIdentifier: %s, networkPolicyMode: %s", podIdentifier, l.networkPolicyMode)
-		err = l.UpdatePodStateEbpfMaps(podIdentifier, POD_STATE_MAP_KEY, state, false, true)
-		if err != nil {
+		if err = l.UpdatePodStateEbpfMaps(podIdentifier, POD_STATE_MAP_KEY, state, false, true); err != nil {
 			log().Errorf("Map update(s) failed for podIdentifier %s error: %v", podIdentifier, err)
+			errs = append(errs, err)
 		}
-
-		err = l.UpdatePodStateEbpfMaps(podIdentifier, CLUSTER_POLICY_POD_STATE_MAP_KEY, cpState, false, true)
-		if err != nil {
+		if err = l.UpdatePodStateEbpfMaps(podIdentifier, CLUSTER_POLICY_POD_STATE_MAP_KEY, cpState, false, true); err != nil {
 			log().Errorf("Map update(s) failed for podIdentifier %s error: %v", podIdentifier, err)
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (l *bpfClient) GetNetworkPolicyMode() string {

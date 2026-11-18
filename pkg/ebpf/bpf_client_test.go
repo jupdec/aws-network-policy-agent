@@ -1539,7 +1539,11 @@ func TestBpfClient_ReAttachEbpfProbes_ReleasesPodIdentifierLocks(t *testing.T) {
 	go func() { done <- client.ReAttachEbpfProbes() }()
 	select {
 	case err := <-done:
-		assert.NoError(t, err)
+		// notAMap is a /dev/null fd, not a BPF map fd. UpdatePodStateEbpfMaps
+		// attempts the BPF_MAP_UPDATE_ELEM syscall and gets EPERM. The error is
+		// now propagated by ReAttachEbpfProbes; the main invariant under test is
+		// that the pod identifier lock is released even when map writes fail.
+		assert.Error(t, err)
 	case <-time.After(time.Second):
 		t.Fatal("ReAttachEbpfProbes did not return")
 	}
@@ -2621,7 +2625,13 @@ func TestBpfClient_ReAttachEbpfProbes_FailedAttachKeepsRecoveredProgram(t *testi
 			}
 			client.bpfTCClient = mockTCClient
 
-			assert.NoError(t, client.ReAttachEbpfProbes())
+			// The TC attach fails with "Link not found". The code falls through
+			// to UpdatePodStateEbpfMaps, which uses the unguarded map index on a
+			// context with no maps (zero-value MapFD) and gets EPERM. That error
+			// is now propagated; the invariant under test is that the recovered
+			// program context is not evicted and no pins are removed.
+			err := client.ReAttachEbpfProbes()
+			assert.Error(t, err)
 			after, ok := client.policyEndpointeBPFContext.Load(podIdentifier)
 			require.True(t, ok)
 			assert.Equal(t, recovered, after)

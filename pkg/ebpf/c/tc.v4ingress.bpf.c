@@ -105,34 +105,42 @@ struct data_t {
 	__u8 tier;
 };
 
-struct bpf_map_def_pvt SEC("maps") cp_ingress_map = {
-	.type = BPF_MAP_TYPE_LPM_TRIE,
-	.key_size =sizeof(struct lpm_trie_key),
-	.value_size = sizeof(struct lpm_cp_trie_val[MAX_PORT_PROTOCOL]),
-	.max_entries = 65536,
-	.map_flags = BPF_F_NO_PREALLOC,
-	.pinning = PIN_GLOBAL_NS,
+// --- Cilium-style split: map-of-maps ---
+// Outer maps keyed by interface index (skb->ifindex).
+// Userspace pre-creates these at node startup with the correct inner_map_fd template,
+// then per new identity creates inner maps and inserts ifindex→inner_fd entries.
+// The program is loaded ONCE; subsequent pods reuse the same prog FD.
+
+#define BPF_MAP_TYPE_HASH_OF_MAPS 12
+
+// Outer: ifindex → cluster-policy LPM trie (per identity)
+struct bpf_map_def_pvt SEC("maps") per_iface_cp_ingress_map = {
+	.type        = BPF_MAP_TYPE_HASH_OF_MAPS,
+	.key_size    = sizeof(__u32),
+	.value_size  = sizeof(__u32),
+	.max_entries = 512,
+	.pinning     = PIN_GLOBAL_NS,
 };
 
-struct bpf_map_def_pvt SEC("maps") ingress_map = {
-	.type = BPF_MAP_TYPE_LPM_TRIE,
-	.key_size =sizeof(struct lpm_trie_key),
-	.value_size = sizeof(struct lpm_trie_val[MAX_PORT_PROTOCOL]),
-	.max_entries = 65536,
-	.map_flags = BPF_F_NO_PREALLOC,
-	.pinning = PIN_GLOBAL_NS,
+// Outer: ifindex → namespace-policy LPM trie (per identity)
+struct bpf_map_def_pvt SEC("maps") per_iface_ingress_map = {
+	.type        = BPF_MAP_TYPE_HASH_OF_MAPS,
+	.key_size    = sizeof(__u32),
+	.value_size  = sizeof(__u32),
+	.max_entries = 512,
+	.pinning     = PIN_GLOBAL_NS,
 };
 
 struct pod_state {
     __u8 state; // 0 => POLICIES_APPLIED, 1 => DEFAULT_ALLOW, 2 => DEFAULT_DENY
 };
 
-struct bpf_map_def_pvt SEC("maps") ingress_pod_state_map = {
-    .type        = BPF_MAP_TYPE_HASH,
-    .key_size    = sizeof(__u32), // network policy key 0, cluster policy key 1
-    .value_size  = sizeof(struct pod_state),
-    .max_entries = 2,
-    .map_flags = BPF_F_NO_PREALLOC,
+// Outer: ifindex → pod-state hash map (per identity)
+struct bpf_map_def_pvt SEC("maps") per_iface_state_map = {
+    .type        = BPF_MAP_TYPE_HASH_OF_MAPS,
+    .key_size    = sizeof(__u32),
+    .value_size  = sizeof(__u32),
+    .max_entries = 512,
     .pinning     = PIN_GLOBAL_NS,
 };
 
@@ -146,14 +154,18 @@ struct bpf_map_def_pvt aws_tcp_reset_pending;
 
 #include "rst_on_deny.h"
 
-static __always_inline int evaluateClusterPolicyByLookUp(struct keystruct trie_key, struct conntrack_key flow_key, __u32 *admin_tier_priority, __u8 *baseline_tier_action) {
+static __always_inline int evaluateClusterPolicyByLookUp(struct keystruct trie_key, struct conntrack_key flow_key, __u32 *admin_tier_priority, __u8 *baseline_tier_action, __u32 ifindex) {
 
 	__u32 admin_tier_action = ACTION_PASS;
 	*baseline_tier_action = ACTION_PASS;
 	*admin_tier_priority = MAX_RULE_PRIORITY;
 	__u32 baseline_tier_priority = MAX_RULE_PRIORITY;
 
-	struct lpm_cp_trie_val *trie_val = bpf_map_lookup_elem(&cp_ingress_map, &trie_key);
+	// Cilium-style two-level lookup: outer(ifindex) → inner LPM trie → rule
+	void *inner_cp = bpf_map_lookup_elem(&per_iface_cp_ingress_map, &ifindex);
+	if (inner_cp == NULL)
+		return ACTION_PASS;
+	struct lpm_cp_trie_val *trie_val = bpf_map_lookup_elem(inner_cp, &trie_key);
 
 	if (trie_val == NULL) {
 		// No cluster policy rules exist, so we pass by default
@@ -188,9 +200,15 @@ static __always_inline int evaluateClusterPolicyByLookUp(struct keystruct trie_k
 	return admin_tier_action;
 }
 
-static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie_key, struct conntrack_key flow_key	, int pod_state) {
-	//Check if it's in the allowed list
-	struct lpm_trie_val *trie_val = bpf_map_lookup_elem(&ingress_map, &trie_key);
+static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie_key, struct conntrack_key flow_key, int pod_state, __u32 ifindex) {
+	// Cilium-style two-level lookup: outer(ifindex) → inner LPM trie → rule
+	void *inner_np = bpf_map_lookup_elem(&per_iface_ingress_map, &ifindex);
+	if (inner_np == NULL) {
+		if (pod_state != POLICIES_APPLIED)
+			return ACTION_PASS;
+		return ACTION_DENY;
+	}
+	struct lpm_trie_val *trie_val = bpf_map_lookup_elem(inner_np, &trie_key);
 	if (trie_val == NULL) {
 		if (pod_state != POLICIES_APPLIED) {
 			// No namespace policy rules exist, so we pass to baseline
@@ -228,25 +246,15 @@ static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie
 	return ACTION_DENY;
 }
 
-static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntrack_key flow_key, __u8 pod_state_val, struct data_t *evt, int pod_state) {
+static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntrack_key flow_key, __u8 pod_state_val, struct data_t *evt, int pod_state, __u32 ifindex) {
 
 		struct conntrack_value flow_val = {};
 		flow_val.last_seen = bpf_ktime_get_ns();
 
 		__u32 admin_tier_priority;
 		__u8 baseline_tier_action;
-		
-		// 1. Lookup Cluster Network Policy
-		//    a. If matched, return the highest priority (lowest numerical value) action from admin tier
-		//       and the highest priority action (lowest numerical value > ADMIN_TIER_PRIORITY_LIMIT) from baseline tier
-		//    b. If no match or admin tier action is PASS, proceed to check namespace scoped network policy
-		// 2. Lookup Namespace Scoped Network Policy
-		//    a. If matched, return the action
-		//    b. If no match, proceed to evaluate based on baseline tier action from cluster policy
-		// 3. If baseline tier action is ALLOW or DENY, enforce that action
-		// 4. If baseline tier action is PASS, enforce default pod policy (DEFAULT_ALLOW or DEFAULT_DENY)
 
-		int admin_tier_action = evaluateClusterPolicyByLookUp(trie_key, flow_key, &admin_tier_priority, &baseline_tier_action);
+		int admin_tier_action = evaluateClusterPolicyByLookUp(trie_key, flow_key, &admin_tier_priority, &baseline_tier_action, ifindex);
 
 		if (admin_tier_priority <= ADMIN_TIER_PRIORITY_LIMIT) {
 			switch (admin_tier_action) {
@@ -271,7 +279,7 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 			}
 		}
 
-		int verdict = evaluateNamespacePolicyByLookUp(trie_key, flow_key, pod_state);
+		int verdict = evaluateNamespacePolicyByLookUp(trie_key, flow_key, pod_state, ifindex);
 		
 		switch (verdict){
 		case ACTION_ALLOW:{
@@ -425,11 +433,16 @@ int handle_ingress(struct __sk_buff *skb)
 		evt.packet_sz = skb->len;
 		evt.is_egress = 0;
 
-		__u32 NETWORK_POLICY_KEY = 0; 
+		__u32 NETWORK_POLICY_KEY = 0;
 		__u32 CLUSTER_NETWORK_POLICY_KEY = 1;
+		__u32 ifindex = skb->ifindex;
 
-		struct pod_state *clusterpolicy_pst = bpf_map_lookup_elem(&ingress_pod_state_map, &CLUSTER_NETWORK_POLICY_KEY);
-		struct pod_state *pst = bpf_map_lookup_elem(&ingress_pod_state_map, &NETWORK_POLICY_KEY);
+		// Cilium-style: look up per-pod state map via outer map keyed by ifindex
+		void *inner_state = bpf_map_lookup_elem(&per_iface_state_map, &ifindex);
+		struct pod_state *clusterpolicy_pst = inner_state ?
+			bpf_map_lookup_elem(inner_state, &CLUSTER_NETWORK_POLICY_KEY) : NULL;
+		struct pod_state *pst = inner_state ?
+			bpf_map_lookup_elem(inner_state, &NETWORK_POLICY_KEY) : NULL;
 
 		// There should always be an entry in pod_state_map. pst returned in above line should never be null.
 		if ((pst == NULL) || (clusterpolicy_pst == NULL)) {
@@ -460,7 +473,7 @@ int handle_ingress(struct __sk_buff *skb)
 
 			// Evaluate the flow again if the pod state has changed and take the decision based on it
 			if (flow_val->val != ct_pod_state_val) {
-				int ret = evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state);
+				int ret = evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state, ifindex);
 				if (ret == BPF_DROP) {
 					bpf_map_delete_elem(&aws_conntrack_map, &flow_key);
 #ifdef NPA_CT_SHORTEN_ON_DENY
@@ -496,7 +509,7 @@ int handle_ingress(struct __sk_buff *skb)
 		}
 
 		// If we reach here, it means it's a new flow or a non-matching response
-		int verdict = evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state);
+		int verdict = evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state, ifindex);
 #ifdef NPA_CT_SHORTEN_ON_DENY
 		// A denied SYN leaves a kernel conntrack entry that is never answered.
 		if (verdict == BPF_DROP) {

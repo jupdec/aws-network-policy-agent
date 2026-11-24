@@ -363,6 +363,15 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 		}
 	}
 
+	// Cilium-style split: initialise outer HASH_OF_MAPS before any pod program loads.
+	splitMaps, splitErr := InitSplitMaps()
+	if splitErr != nil {
+		log().Warnf("Cilium identity split init failed (%v); falling back to per-identity LoadBpfFile", splitErr)
+	} else {
+		ebpfClient.splitMaps = splitMaps
+		log().Info("Cilium identity split active: LoadBpfFile will run once per direction")
+	}
+
 	// Every TC program references the shared maps, so they must exist before
 	// the deferred ct-deny probe below and before any pod's program loads.
 	tcConfigMap, dropCountMap, err := ebpfClient.loadTCSharedMaps(eventsUpdateRequired || reloadTCSharedMaps)
@@ -507,6 +516,10 @@ type bpfClient struct {
 	clusterPolicyEgressInMemoryMap *sync.Map
 	// This is in-memory map to track recently deleted pods (key: podNamespacedName, value: time added to map)
 	deletedPods *sync.Map
+
+	// Cilium-style identity split: outer HASH_OF_MAPS and cached prog FDs.
+	// Populated by InitSplitMaps at startup; non-nil when the split is active.
+	splitMaps *IdentitySplitMaps
 }
 
 // resolveGlobalMap prefers the map from a fresh events-binary load, else the
@@ -1466,9 +1479,30 @@ func closeLoadedObjects(progInfo map[string]goelf.BpfData, loadedMaps map[string
 func (l *bpfClient) loadBPFProgram(fileName string, direction string,
 	podIdentifier string) (map[string]goelf.BpfData, int, error) {
 
+	// Cilium split: if generic prog already loaded for this direction, reuse it.
+	// Skip LoadBpfFile entirely — the verifier already ran once.
+	if l.splitMaps != nil {
+		inFD, egFD := l.splitMaps.GetGenericProgFDs()
+		cachedFD := inFD
+		if direction == "egress" {
+			cachedFD = egFD
+		}
+		if cachedFD > 0 {
+			log().Infof("Cilium split: reusing cached %s prog FD %d for %s (no LoadBpfFile)", direction, cachedFD, podIdentifier)
+			pinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, direction)
+			progInfo := map[string]goelf.BpfData{
+				pinPath: {
+					Program: goebpfprogs.BpfProgram{ProgFD: cachedFD},
+					Maps:    map[string]goebpfmaps.BpfMap{},
+				},
+			}
+			return progInfo, cachedFD, nil
+		}
+	}
+
 	start := time.Now()
 	log().Info("Load the eBPF program")
-	// Load a new instance of the program
+	// Load a new instance of the program (first identity or split disabled)
 	progInfo, loadedMaps, err := l.bpfSDKClient.LoadBpfFile(fileName, podIdentifier)
 	duration := msSince(start)
 	sdkAPILatency.WithLabelValues("LoadBpfFile", fmt.Sprint(err != nil)).Observe(duration)
@@ -1502,6 +1536,16 @@ func (l *bpfClient) loadBPFProgram(fileName string, direction string,
 	}
 
 	log().Infof("Prog Load Succeeded for %s, progFD: %d, pinpath: %s, maps: %d", direction, progFD, pinPath, len(bpfData.Maps))
+
+	// Cilium split: cache this prog FD so subsequent identities skip LoadBpfFile.
+	if l.splitMaps != nil {
+		if direction == "ingress" {
+			l.splitMaps.SetGenericIngressProgFD(progFD)
+		} else {
+			l.splitMaps.SetGenericEgressProgFD(progFD)
+		}
+		log().Infof("Cilium split: cached %s prog FD %d", direction, progFD)
+	}
 
 	return progInfo, progFD, nil
 }

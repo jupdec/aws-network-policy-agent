@@ -30,6 +30,7 @@ import (
 	"github.com/aws/aws-network-policy-agent/pkg/utils/cp"
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -1023,6 +1024,24 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 	for index, hostVethName := range hostVethNames {
 		log().Infof("AttacheBPFProbes for pod %s in namespace %s with hostVethName %s at interface %d", pod.Name, pod.Namespace, hostVethName, index)
 
+		// Cilium split: create inner maps for this veth's ifindex and populate outer maps.
+		if l.splitMaps != nil {
+			if link, linkErr := netlink.LinkByName(hostVethName); linkErr == nil {
+				ifindex := uint32(link.Attrs().Index)
+				// lpmValueSize = sizeof(lpm_trie_val[24]) = 24*12 = 288
+				// cpLpmValueSize = sizeof(lpm_cp_trie_val[24]) = 24*16 = 384
+				innerMaps, innerErr := l.splitMaps.CreateInnerMaps(ifindex, 288, 384)
+				if innerErr != nil {
+					log().Warnf("Cilium split: CreateInnerMaps failed for %s ifindex %d: %v", hostVethName, ifindex, innerErr)
+				} else {
+					innerMaps.Close()
+					log().Infof("Cilium split: inner maps created for ifindex %d (%s)", ifindex, hostVethName)
+				}
+			} else {
+				log().Warnf("Cilium split: LinkByName(%s) failed: %v", hostVethName, linkErr)
+			}
+		}
+
 		if !isIngressProbeAttached {
 			start := time.Now()
 			ingressProgFD, _, err = l.attachIngressBPFProbe(hostVethName, podIdentifier)
@@ -1502,8 +1521,14 @@ func (l *bpfClient) loadBPFProgram(fileName string, direction string,
 
 	start := time.Now()
 	log().Info("Load the eBPF program")
-	// Load a new instance of the program (first identity or split disabled)
-	progInfo, loadedMaps, err := l.bpfSDKClient.LoadBpfFile(fileName, podIdentifier)
+	// Cilium split: first load uses a fixed global identifier so the outer
+	// HASH_OF_MAPS are pinned at a known global path (matching InitSplitMaps).
+	// All subsequent loads skip LoadBpfFile and return the cached FD above.
+	loadID := podIdentifier
+	if l.splitMaps != nil {
+		loadID = SplitGlobalID
+	}
+	progInfo, loadedMaps, err := l.bpfSDKClient.LoadBpfFile(fileName, loadID)
 	duration := msSince(start)
 	sdkAPILatency.WithLabelValues("LoadBpfFile", fmt.Sprint(err != nil)).Observe(duration)
 	if err != nil {
@@ -1514,7 +1539,11 @@ func (l *bpfClient) loadBPFProgram(fileName string, direction string,
 
 	// Validate the loaded program before returning it. A successful LoadBpfFile
 	// must yield a program with a valid FD and its associated maps linked.
-	pinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, direction)
+	lookupID := podIdentifier
+	if l.splitMaps != nil {
+		lookupID = SplitGlobalID
+	}
+	pinPath := utils.GetBPFPinPathFromPodIdentifier(lookupID, direction)
 	bpfData, ok := progInfo[pinPath]
 	if !ok {
 		sdkAPIErr.WithLabelValues("LoadBpfFile-NoPinPath").Inc()

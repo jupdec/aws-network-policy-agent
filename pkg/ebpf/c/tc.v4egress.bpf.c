@@ -106,7 +106,7 @@ struct data_t {
 };
 
 // --- Cilium-style split: map-of-maps (egress) ---
-#define BPF_MAP_TYPE_HASH_OF_MAPS 12
+#define BPF_MAP_TYPE_HASH_OF_MAPS 13
 
 struct bpf_map_def_pvt SEC("maps") per_iface_cp_egress_map = {
 	.type        = BPF_MAP_TYPE_HASH_OF_MAPS,

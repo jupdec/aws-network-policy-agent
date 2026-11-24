@@ -111,7 +111,7 @@ struct data_t {
 // then per new identity creates inner maps and inserts ifindex→inner_fd entries.
 // The program is loaded ONCE; subsequent pods reuse the same prog FD.
 
-#define BPF_MAP_TYPE_HASH_OF_MAPS 12
+#define BPF_MAP_TYPE_HASH_OF_MAPS 13
 
 // Outer: ifindex → cluster-policy LPM trie (per identity)
 struct bpf_map_def_pvt SEC("maps") per_iface_cp_ingress_map = {

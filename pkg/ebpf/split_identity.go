@@ -22,12 +22,16 @@ import (
 
 const (
 	// Global outer map pin paths (pre-created at startup, shared across all pods)
-	splitIngressMapPin   = "/sys/fs/bpf/globals/aws/maps/global_per_iface_ingress_map"
-	splitCPIngressMapPin = "/sys/fs/bpf/globals/aws/maps/global_per_iface_cp_ingress_map"
-	splitStateInMapPin   = "/sys/fs/bpf/globals/aws/maps/global_per_iface_state_map"
-	splitEgressMapPin    = "/sys/fs/bpf/globals/aws/maps/global_per_iface_egress_map"
-	splitCPEgressMapPin  = "/sys/fs/bpf/globals/aws/maps/global_per_iface_cp_egress_map"
-	splitStateOutMapPin  = "/sys/fs/bpf/globals/aws/maps/global_per_iface_egress_state_map"
+	// Pin paths must match what aws-ebpf-sdk-go generates for a fixed identifier
+	// (BPF_MAPS_PIN_PATH_DIRECTORY + SplitGlobalID + "_" + mapName).
+	SplitGlobalID = "cilium_split"
+
+	splitIngressMapPin   = "/sys/fs/bpf/globals/aws/maps/" + SplitGlobalID + "_per_iface_ingress_map"
+	splitCPIngressMapPin = "/sys/fs/bpf/globals/aws/maps/" + SplitGlobalID + "_per_iface_cp_ingress_map"
+	splitStateInMapPin   = "/sys/fs/bpf/globals/aws/maps/" + SplitGlobalID + "_per_iface_state_map"
+	splitEgressMapPin    = "/sys/fs/bpf/globals/aws/maps/" + SplitGlobalID + "_per_iface_egress_map"
+	splitCPEgressMapPin  = "/sys/fs/bpf/globals/aws/maps/" + SplitGlobalID + "_per_iface_cp_egress_map"
+	splitStateOutMapPin  = "/sys/fs/bpf/globals/aws/maps/" + SplitGlobalID + "_per_iface_egress_state_map"
 
 	// Max pods per node (outer map capacity)
 	maxPodsPerNode = 512
@@ -35,7 +39,7 @@ const (
 	// BPF map type constants
 	bpfMapTypeLPMTrie    = 11
 	bpfMapTypeHash       = 1
-	bpfMapTypeHashOfMaps = 12
+	bpfMapTypeHashOfMaps = 13 // BPF_MAP_TYPE_HASH_OF_MAPS (12 is ARRAY_OF_MAPS)
 
 	// BPF syscall commands
 	bpfCmdMapCreate     = 0

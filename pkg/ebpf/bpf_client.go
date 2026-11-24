@@ -1102,7 +1102,13 @@ func (l *bpfClient) ensureBPFProgram(podIdentifier string, direction string) (pr
 	if err != nil {
 		return 0, false, err
 	}
-	*pgmInfo = progInfo[utils.GetBPFPinPathFromPodIdentifier(podIdentifier, direction)]
+	// Cilium split: loadBPFProgram uses SplitGlobalID as the key, not podIdentifier.
+	// Use the correct lookup key to find the program data.
+	lookupKey := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, direction)
+	if l.splitMaps != nil {
+		lookupKey = utils.GetBPFPinPathFromPodIdentifier(SplitGlobalID, direction)
+	}
+	*pgmInfo = progInfo[lookupKey]
 	l.policyEndpointeBPFContext.Store(podIdentifier, peBPFContext)
 	return progFD, true, nil
 }
